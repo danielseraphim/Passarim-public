@@ -1,26 +1,17 @@
-// Brazilian-bird-inspired whistle synthesizer — HYBRID, MUSICALLY OPINIONATED.
+// Brazilian-bird-inspired whistle synthesizer — single-buffer per syllable.
 //
-// Design choices (current rev — humanised calibration):
-//   - Onsets drive syllable timings; pitch sampled at each onset; each
-//     syllable is its OWN bird-shaped event. No continuous pitch tracking
-//     between onsets ⇒ no theremin.
-//   - Pitch is QUANTISED with MAGNETISM (~70 %) toward the nearest semitone.
-//     Soft pull rather than rigid snap — the melody is tonally clear but
-//     each note keeps a small expressive offset, so it doesn't sound like
-//     a tuner-locked synth.
-//   - Default contour shape is "flat", but flats now BREATHE (±4 cents
-//     slow drift across the syllable). No long sweep, just gentle
-//     instability — the difference between a held vocal note and a
-//     sustained synth tone.
-//   - Envelope is fast but NOT linear: exponential 5 ms attack and 10 ms
-//     release. Crisp ictus without the digital-step click of a linear
-//     ramp on amplitude.
-//   - Ornaments only at phrase ends, low base probability.
+// Goal: preserve the user's melody intelligibly with the timbre of their own
+// whistle, lightly humanised. We dropped granular synthesis: one
+// AudioBufferSourceNode per syllable, with playbackRate setting the anchor
+// pitch and detune.linearRampToValueAtTime applying the per-syllable
+// contour in cents. Cleaner, no AM-buzz from grain crossfading, syllables
+// are genuinely discrete.
 //
 // Pipeline:
 //   YIN → median → octave-error correction → EMA → onset detection
-//   (energy AND pitch jumps) → for each onset: magnetism-quantise, pick
-//   contour shape, schedule grains → reverb / formant / limiter
+//   (energy AND pitch jumps) → for each onset: magnetism-quantise pitch,
+//   pick contour shape, schedule ONE buffer source with detune contour
+//   → reverb / formant / limiter
 
 const SOURCE_URL = "/whistle-source.ogg";
 const SOURCE_PITCH = 1500;
@@ -377,18 +368,13 @@ function buildContour(
   anchorPitch: number,
   rng: () => number,
 ): { t: number; f: number }[] {
-  // ── Flat with breathing: held tone but with ±4 cents slow arc drift.
-  // Without breathing, the held note sounds like a sustained synth tone.
-  // The drift is too small to read as "movement", but big enough to feel
-  // alive — same trick a vocalist uses on a held note.
   if (shape === "flat") {
-    const breathCentsPeak = 4 * (rng() * 0.6 + 0.7); // 2.8 – 6.4 cents
+    const breathCentsPeak = 4 * (rng() * 0.6 + 0.7);
     const direction = rng() < 0.5 ? 1 : -1;
     const N = 4;
     const pts: { t: number; f: number }[] = [];
     for (let i = 0; i <= N; i++) {
       const u = i / N;
-      // Half-sine arch — peaks mid-syllable, returns near anchor at edges.
       const cents = direction * breathCentsPeak * Math.sin(u * Math.PI);
       const f = anchorPitch * Math.pow(2, cents / 1200);
       pts.push({ t: u * duration, f });
@@ -447,30 +433,6 @@ function appendOrnament(
   return { contour: newPts, newDuration: baseDuration + ornDur };
 }
 
-function interpolateContour(
-  contour: { t: number; f: number }[],
-  tInSyl: number,
-): number {
-  if (contour.length === 0) return 0;
-  if (tInSyl <= contour[0].t) return contour[0].f;
-  if (tInSyl >= contour[contour.length - 1].t) return contour[contour.length - 1].f;
-  for (let i = 1; i < contour.length; i++) {
-    if (contour[i].t >= tInSyl) {
-      const a = contour[i - 1];
-      const b = contour[i];
-      const u = (tInSyl - a.t) / (b.t - a.t);
-      return a.f + (b.f - a.f) * u;
-    }
-  }
-  return contour[contour.length - 1].f;
-}
-
-/**
- * Magnetism quantisation: pull the input pitch toward the nearest semitone
- * by `magnetism` (0 = no quantisation, 1 = rigid snap). 0.7 leaves enough
- * humanity that singers don't sound auto-tuned, while still pulling the
- * melody onto recognisable notes.
- */
 function quantiseToSemitone(hz: number, magnetism = 0.7): number {
   if (hz <= 0) return hz;
   const midi = 12 * Math.log2(hz / 440) + 69;
@@ -479,7 +441,7 @@ function quantiseToSemitone(hz: number, magnetism = 0.7): number {
   return 440 * Math.pow(2, (blended - 69) / 12);
 }
 
-function createReverbIR(ctx: BaseAudioContext, durationSec = 1.2): AudioBuffer {
+function createReverbIR(ctx: BaseAudioContext, durationSec = 0.5): AudioBuffer {
   const sampleRate = ctx.sampleRate;
   const length = Math.floor(sampleRate * durationSec);
   const impulse = ctx.createBuffer(1, length, sampleRate);
@@ -497,6 +459,7 @@ type Syllable = {
   amplitude: number;
   contour: { t: number; f: number }[];
   isAccented: boolean;
+  anchorPitch: number;
 };
 
 export async function translateToBird(
@@ -590,8 +553,6 @@ export async function translateToBird(
     const ornamentProb = 0.15 + bird.warble * 0.25;
     const wantOrnament = isPhraseEnd && dur > 0.10 && rng() < ornamentProb;
 
-    // Detune ±9 cents — wider than ±6 so adjacent same-note syllables drift
-    // audibly enough to feel human.
     const detuneCents = (rng() - 0.5) * 18;
     const detuneRatio = Math.pow(2, detuneCents / 1200);
 
@@ -614,10 +575,11 @@ export async function translateToBird(
     const amplitudeBase = Math.min(1, rmss[idx] / peakRms + 0.15);
     const amplitude = isAccented ? Math.min(1, amplitudeBase * 1.25) : amplitudeBase;
 
-    syllables.push({ start, duration: dur, amplitude, contour, isAccented });
+    syllables.push({ start, duration: dur, amplitude, contour, isAccented, anchorPitch });
   }
 
-  const reverbTail = 1.4;
+  // Drier reverb (0.5 s tail, 0.15 wet) — phrases stay distinct.
+  const reverbTail = 0.7;
   const totalLen = Math.floor((duration + reverbTail) * sampleRate);
   const offline = new OfflineAudioContext(1, totalLen, sampleRate);
 
@@ -642,9 +604,9 @@ export async function translateToBird(
   limiter.connect(master);
 
   const convolver = offline.createConvolver();
-  convolver.buffer = createReverbIR(offline, 1.2);
+  convolver.buffer = createReverbIR(offline, 0.5);
   const reverbGain = offline.createGain();
-  reverbGain.gain.value = 0.28;
+  reverbGain.gain.value = 0.15;
   limiter.connect(convolver).connect(reverbGain).connect(master);
 
   const highpass = offline.createBiquadFilter();
@@ -664,16 +626,18 @@ export async function translateToBird(
   const noiseData = noiseBuf.getChannelData(0);
   for (let i = 0; i < noiseData.length; i++) noiseData[i] = Math.random() * 2 - 1;
 
-  const sourceUsableLen = Math.max(0.05, sourceBuffer.duration - 0.1);
-  const GRAIN_SIZE = 0.05;
-  const GRAIN_HOP = 0.018;
+  const sourceUsableLen = Math.max(0.05, sourceBuffer.duration - 0.2);
+  let sourceCursor = 0;
+  const SOURCE_CURSOR_STEP = 0.13;
 
-  for (const syl of syllables) {
+  // ── ONE BufferSource per syllable. Pitch comes from playbackRate (anchor)
+  // plus detune automation (contour, in cents relative to anchor). No
+  // grain crossfading ⇒ no AM buzz.
+  for (let i = 0; i < syllables.length; i++) {
+    const syl = syllables[i];
     const sylEnv = offline.createGain();
     sylEnv.connect(highpass);
 
-    // Exponential ramps, fast but vocal — no derivative-step click on the
-    // amplitude. Attack 5 ms (3 ms when accented), release 10 ms.
     const baseAttack = 0.005;
     const attack = syl.isAccented ? 0.003 : baseAttack;
     const release = 0.010;
@@ -688,31 +652,39 @@ export async function translateToBird(
     );
     sylEnv.gain.exponentialRampToValueAtTime(0.0001, syl.start + syl.duration);
 
-    const numGrains = Math.max(2, Math.ceil(syl.duration / GRAIN_HOP) + 1);
-    let sourcePos = (syl.start * 0.37) % sourceUsableLen;
-    for (let g = 0; g < numGrains; g++) {
-      const tInSyl = g * GRAIN_HOP;
-      if (tInSyl > syl.duration + GRAIN_SIZE) break;
+    const src = offline.createBufferSource();
+    src.buffer = sourceBuffer;
+    // Base pitch ratio (anchor / source)
+    const baseRate = Math.min(4.0, Math.max(0.4, syl.anchorPitch / SOURCE_PITCH));
+    src.playbackRate.value = baseRate;
 
-      const u = Math.min(1, tInSyl / Math.max(0.001, syl.duration));
-      const contourPitch = interpolateContour(syl.contour, u * syl.duration);
-      const playbackRate = Math.min(4.0, Math.max(0.4, contourPitch / SOURCE_PITCH));
-
-      const tAbs = syl.start + tInSyl;
-      const grain = offline.createBufferSource();
-      grain.buffer = sourceBuffer;
-      grain.playbackRate.value = playbackRate;
-
-      const grainGain = offline.createGain();
-      grainGain.gain.setValueAtTime(0.0001, tAbs);
-      grainGain.gain.linearRampToValueAtTime(1, tAbs + GRAIN_SIZE / 2);
-      grainGain.gain.linearRampToValueAtTime(0.0001, tAbs + GRAIN_SIZE);
-
-      grain.connect(grainGain).connect(sylEnv);
-      grain.start(tAbs, sourcePos, GRAIN_SIZE * playbackRate + 0.01);
-      sourcePos = (sourcePos + 0.014) % sourceUsableLen;
+    // Apply contour as detune in cents relative to anchor.
+    if (syl.contour.length > 0) {
+      const initialCents = 1200 * Math.log2(
+        Math.max(1, syl.contour[0].f) / syl.anchorPitch,
+      );
+      src.detune.setValueAtTime(initialCents, syl.start);
+      for (let p = 1; p < syl.contour.length; p++) {
+        const cents = 1200 * Math.log2(
+          Math.max(1, syl.contour[p].f) / syl.anchorPitch,
+        );
+        src.detune.linearRampToValueAtTime(
+          cents,
+          syl.start + syl.contour[p].t,
+        );
+      }
     }
 
+    // Different start offset per syllable so the timbre VARIES across
+    // syllables instead of every note sounding identical.
+    const sourceStart = sourceCursor;
+    sourceCursor = (sourceCursor + SOURCE_CURSOR_STEP) % sourceUsableLen;
+
+    src.connect(sylEnv);
+    src.start(syl.start, sourceStart);
+    src.stop(syl.start + syl.duration + 0.05);
+
+    // Onset transient noise — same as before
     const noiseSrc = offline.createBufferSource();
     noiseSrc.buffer = noiseBuf;
     const noiseBp = offline.createBiquadFilter();
