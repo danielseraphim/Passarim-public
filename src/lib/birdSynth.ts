@@ -1,27 +1,26 @@
 // Brazilian-bird-inspired whistle synthesizer — HYBRID, MUSICALLY OPINIONATED.
 //
-// Onsets in the input drive syllable timings. At each onset we sample the
-// user's pitch and use it as the ANCHOR for a per-syllable bird-shaped
-// contour (rise / fall / arch / dip / trill). Between syllables: silence,
-// no continuous pitch tracking — that's what eliminates the theremin
-// quality. Each syllable is rendered as overlapping grains of the user's
-// own whistle sample.
+// Design choices (current rev):
+//   - Onsets drive syllable timings; pitch is sampled at each onset; each
+//     syllable is its OWN bird-shaped event. No continuous pitch tracking
+//     between onsets ⇒ no theremin.
+//   - Pitch is QUANTISED to the nearest semitone (12-TET) before applying
+//     ±6 cent expressive detune. This eliminates the "siren" glissando
+//     between notes and gives the output a tonal, melodic backbone.
+//   - The default contour shape is "flat" (held tone, no in-syllable
+//     pitch variation). Other shapes (rise / fall / arch / dip / trill)
+//     are kept but rare; they preserve some bird character without
+//     swamping the melody.
+//   - Envelope is percussive (linear 4 ms attack, ~8 ms release) instead
+//     of soft exponential ⇒ a crisp "ictus" at each note.
+//   - Ornaments only at phrase ends, low base probability.
 //
-// Pipeline overview:
-//   YIN (covers voice + whistle) → median filter → octave-error correction
-//   → EMA smoothing → onset detection (energy peaks AND pitch jumps)
-//   → for each onset: pick contour shape, anchor at user's pitch, schedule
-//     grains across the contour
-//   → reverb, formant filter, limiter
-//
-// Four "musician" passes layered on top:
-//   P1 — Articulation: hard duration cap (180 ms), enforced 40 ms silence,
-//        fast attacks. No legato bleed.
-//   P2 — Ornamentation: short semitone trills only on phrase ends, with
-//        probability proportional to bird.warble.
-//   P3 — Microtonality: ±6 cents random detune per syllable.
-//   P4 — Phrasal accent: first onset and onsets after longer-than-mean gap
-//        get +25 % amplitude and a sharper attack.
+// Pipeline:
+//   YIN (covers voice + whistle) → median → octave-error correction
+//   → EMA smoothing → onset detection (energy AND pitch jumps)
+//   → for each onset: quantise to nearest semitone, pick contour shape,
+//     schedule grains
+//   → reverb / formant filter / limiter
 
 const SOURCE_URL = "/whistle-source.ogg";
 const SOURCE_PITCH = 1500;
@@ -59,43 +58,37 @@ export type BirdProfile = {
 
 export const BIRDS: Record<string, BirdProfile> = {
   bemtevi: {
-    name: "Bem-te-vi",
-    accent: "#F2C94C",
+    name: "Bem-te-vi", accent: "#F2C94C",
     baseFreq: 2400, pitchRange: 700, trill: 4.0, warble: 0.5,
     formantFreq: 2800, formantQ: 3.5, attackHardness: 0.7,
     description: "O guardião da manhã, canto claro que abre o dia na natureza.",
   },
   sabia: {
-    name: "Sabiá-laranjeira",
-    accent: "#E67E22",
+    name: "Sabiá-laranjeira", accent: "#E67E22",
     baseFreq: 2100, pitchRange: 600, trill: 3.5, warble: 0.6,
     formantFreq: 2400, formantQ: 3.0, attackHardness: 0.3,
     description: "Poeta da paisagem, seu canto é memória e tradição.",
   },
   uirapuru: {
-    name: "Uirapuru",
-    accent: "#E74C3C",
+    name: "Uirapuru", accent: "#E74C3C",
     baseFreq: 2500, pitchRange: 900, trill: 7.0, warble: 1.0,
     formantFreq: 2700, formantQ: 2.5, attackHardness: 0.5,
     description: "Raro e misterioso, seu canto ecoa como encantamento da mata.",
   },
   azulao: {
-    name: "Azulão",
-    accent: "#2D7DD2",
+    name: "Azulão", accent: "#2D7DD2",
     baseFreq: 2200, pitchRange: 400, trill: 2.5, warble: 0.3,
     formantFreq: 2200, formantQ: 4.5, attackHardness: 0.4,
     description: "Força e beleza, seu canto é firme e marcante.",
   },
   tiesangue: {
-    name: "Tiê-sangue",
-    accent: "#6BAF6B",
+    name: "Tiê-sangue", accent: "#6BAF6B",
     baseFreq: 2800, pitchRange: 500, trill: 5.0, warble: 0.5,
     formantFreq: 3200, formantQ: 4.0, attackHardness: 0.7,
     description: "Pequeno notável, seu canto é alegria que contagia.",
   },
   sanhacu: {
-    name: "Sanhaçu",
-    accent: "#A48DBA",
+    name: "Sanhaçu", accent: "#A48DBA",
     baseFreq: 3000, pitchRange: 500, trill: 4.0, warble: 0.6,
     formantFreq: 3500, formantQ: 3.0, attackHardness: 0.6,
     description: "Cores que cantam, sua presença é pura vibração.",
@@ -253,15 +246,6 @@ function medianFilter(arr: number[], k = 7): number[] {
   return out;
 }
 
-/**
- * Cross-frame octave-error correction. YIN sometimes locks onto a sub-
- * harmonic (returning half the true F0) or a super-harmonic (double).
- * For each voiced frame, compare against the median of voiced frames in
- * a ±15-frame window. If it's <0.6× the median → octave-down error,
- * multiply by 2. If >1.6× the median → octave-up error, divide by 2.
- * Threshold 0.6/1.6 is conservative enough not to "fix" legitimate
- * musical leaps (an octave is exactly 0.5/2.0).
- */
 function correctOctaveErrors(f0: number[]): number[] {
   const out = f0.slice();
   const W = 15;
@@ -300,12 +284,6 @@ function emaSmooth(arr: number[], alpha = 0.4): number[] {
   return out;
 }
 
-/**
- * Onset detection — combines energy peaks (good for articulated input
- * like "lá-lá-lá") with pitch-change detection (good for legato whistled
- * input where amplitude doesn't dip much between notes). Both feed into
- * a single sorted-and-deduped list with a refractory period.
- */
 function detectOnsets(
   rmss: number[],
   f0: number[],
@@ -313,7 +291,6 @@ function detectOnsets(
 ): number[] {
   if (rmss.length < 4) return [];
 
-  // ── Energy onsets (existing logic) ──
   const sm = new Array(rmss.length);
   let s = 0;
   for (let i = 0; i < rmss.length; i++) {
@@ -334,9 +311,6 @@ function detectOnsets(
     }
   }
 
-  // ── Pitch-change onsets ──
-  // Track a slowly-updated "current note" pitch. When a frame's pitch
-  // departs from it by >50 cents, that's a new note onset.
   const pitchOnsets: number[] = [];
   let stablePitch = 0;
   for (let i = 0; i < f0.length; i++) {
@@ -348,14 +322,12 @@ function detectOnsets(
     const cents = Math.abs(1200 * Math.log2(f0[i] / stablePitch));
     if (cents > 50) {
       pitchOnsets.push(i);
-      stablePitch = f0[i]; // reset to new note
+      stablePitch = f0[i];
     } else {
-      // slowly drift the stable estimate
       stablePitch = stablePitch * 0.7 + f0[i] * 0.3;
     }
   }
 
-  // ── Merge & dedupe with refractory ──
   const all = [...energyOnsets, ...pitchOnsets].sort((a, b) => a - b);
   const merged: number[] = [];
   let last = -refractoryFrames;
@@ -365,9 +337,6 @@ function detectOnsets(
       last = idx;
     }
   }
-
-  // Stationary fallback: if NEITHER kind of onset fired, sprinkle a regular
-  // pulse so we still produce something rather than silence.
   if (merged.length === 0) {
     const totalDur = rmss.length * hopSec;
     const count = Math.max(3, Math.min(14, Math.round(totalDur / 0.35)));
@@ -378,7 +347,10 @@ function detectOnsets(
   return merged;
 }
 
-type ContourShape = "rise" | "fall" | "arch" | "dip" | "trill";
+// ── Contour shapes. "flat" is the new default — held anchor pitch with no
+// in-syllable variation. The melodic shape comes from sequencing different
+// flat anchors across syllables, not from sweeping pitch within a syllable.
+type ContourShape = "flat" | "rise" | "fall" | "arch" | "dip" | "trill";
 
 function makeRng(seed: number): () => number {
   let s = seed >>> 0;
@@ -392,7 +364,11 @@ function makeRng(seed: number): () => number {
 }
 
 function pickShape(bird: BirdProfile, rng: () => number): ContourShape {
-  if (rng() < bird.warble * 0.55) return "trill";
+  // Trill probability scales with warble, capped at 40 % for the highest.
+  if (rng() < bird.warble * 0.4) return "trill";
+  // FLAT is the default. High-warble birds (uirapuru) get more variation.
+  if (rng() < 0.85 - bird.warble * 0.35) return "flat";
+  // Remaining slice (~12-30 % depending on warble) spread across moving shapes.
   const r = rng();
   if (r < 0.3) return "rise";
   if (r < 0.55) return "fall";
@@ -407,6 +383,13 @@ function buildContour(
   anchorPitch: number,
   rng: () => number,
 ): { t: number; f: number }[] {
+  // For flat we just hold the anchor — a single straight line.
+  if (shape === "flat") {
+    return [
+      { t: 0, f: anchorPitch },
+      { t: duration, f: anchorPitch },
+    ];
+  }
   const center = anchorPitch * (0.97 + rng() * 0.06);
   const span = bird.pitchRange * (0.45 + rng() * 0.55);
   const lo = center - span / 2;
@@ -476,6 +459,14 @@ function interpolateContour(
   return contour[contour.length - 1].f;
 }
 
+/** Snap a frequency to the nearest semitone in 12-tone equal temperament. */
+function quantiseToSemitone(hz: number): number {
+  if (hz <= 0) return hz;
+  const midi = 12 * Math.log2(hz / 440) + 69;
+  const rounded = Math.round(midi);
+  return 440 * Math.pow(2, (rounded - 69) / 12);
+}
+
 function createReverbIR(ctx: BaseAudioContext, durationSec = 1.2): AudioBuffer {
   const sampleRate = ctx.sampleRate;
   const length = Math.floor(sampleRate * durationSec);
@@ -529,9 +520,6 @@ export async function translateToBird(
     if (conf > 0.4 && f0 > 80 && f0 < 3500) f0s[i] = f0;
   }
 
-  // Pipeline: median → octave correction → EMA. Pitch-jump onsets use the
-  // median+corrected version (sharp transitions preserved); syllable anchor
-  // sampling uses the EMA-smoothed version (no micro-jitter).
   const f0Med = medianFilter(f0s, 7);
   const f0Corr = correctOctaveErrors(f0Med);
   const f0Smooth = emaSmooth(f0Corr, 0.4);
@@ -551,7 +539,6 @@ export async function translateToBird(
   const octaveShift = Math.round(Math.log2(bird.baseFreq / avgF0));
   const shiftFactor = Math.pow(2, octaveShift);
 
-  // P4: mean inter-onset interval for accent detection
   const iois: number[] = [];
   for (let i = 1; i < onsets.length; i++) {
     iois.push((onsets[i] - onsets[i - 1]) * hopSec);
@@ -587,16 +574,24 @@ export async function translateToBird(
     const prevGap = i === 0 ? Infinity : start - onsets[i - 1] * hopSec;
     const isAccented = i === 0 || prevGap > meanIOI * 1.3;
     const isPhraseEnd = i === onsets.length - 1 || gap > meanIOI * 1.5;
-    const ornamentProb = 0.5 + bird.warble * 0.3;
+    // P4 tuned down: ornaments are now rare even on phrase ends
+    const ornamentProb = 0.15 + bird.warble * 0.25;
     const wantOrnament = isPhraseEnd && dur > 0.10 && rng() < ornamentProb;
 
+    // P3 microtonality (applied AFTER quantisation so the syllable lands on
+    // a real note plus a small expressive offset, instead of drifting
+    // randomly through cracks between notes).
     const detuneCents = (rng() - 0.5) * 12;
     const detuneRatio = Math.pow(2, detuneCents / 1200);
 
+    // ── Pitch quantisation: snap user pitch (transposed) to nearest semitone
+    const transposed = userPitch * shiftFactor;
+    const quantised = quantiseToSemitone(transposed);
     const anchorPitch = Math.min(
       4500,
-      Math.max(800, userPitch * shiftFactor * detuneRatio),
+      Math.max(800, quantised * detuneRatio),
     );
+
     const shape = pickShape(bird, rng);
     let contour = buildContour(shape, bird, dur, anchorPitch, rng);
 
@@ -667,19 +662,23 @@ export async function translateToBird(
     const sylEnv = offline.createGain();
     sylEnv.connect(highpass);
 
-    const baseAttack = 0.006 + (1 - bird.attackHardness) * 0.008;
-    const attack = syl.isAccented ? baseAttack * 0.6 : baseAttack;
-    const release = 0.04;
+    // P1+ — percussive envelope: linear ramps, sharp attack, sharp release.
+    // Was: exponential, 6-14 ms attack, 40 ms release. Now: 4 ms / 8 ms,
+    // both linear. This is what gives each note an "ictus" instead of an
+    // atmospheric fade.
+    const baseAttack = 0.004;
+    const attack = syl.isAccented ? 0.003 : baseAttack;
+    const release = 0.008;
 
     const peak = Math.min(0.6, 0.18 + syl.amplitude * 0.55) *
       (0.7 + 0.4 * Math.min(1, 0.18 / syl.duration));
-    sylEnv.gain.setValueAtTime(0.0001, syl.start);
-    sylEnv.gain.exponentialRampToValueAtTime(peak, syl.start + attack);
+    sylEnv.gain.setValueAtTime(0, syl.start);
+    sylEnv.gain.linearRampToValueAtTime(peak, syl.start + attack);
     sylEnv.gain.setValueAtTime(
       peak,
       syl.start + Math.max(attack, syl.duration - release),
     );
-    sylEnv.gain.exponentialRampToValueAtTime(0.0001, syl.start + syl.duration + 0.04);
+    sylEnv.gain.linearRampToValueAtTime(0, syl.start + syl.duration);
 
     const numGrains = Math.max(2, Math.ceil(syl.duration / GRAIN_HOP) + 1);
     let sourcePos = (syl.start * 0.37) % sourceUsableLen;
