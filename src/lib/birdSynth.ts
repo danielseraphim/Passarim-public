@@ -1,26 +1,26 @@
 // Brazilian-bird-inspired whistle synthesizer — HYBRID, MUSICALLY OPINIONATED.
 //
-// Design choices (current rev):
-//   - Onsets drive syllable timings; pitch is sampled at each onset; each
+// Design choices (current rev — humanised calibration):
+//   - Onsets drive syllable timings; pitch sampled at each onset; each
 //     syllable is its OWN bird-shaped event. No continuous pitch tracking
 //     between onsets ⇒ no theremin.
-//   - Pitch is QUANTISED to the nearest semitone (12-TET) before applying
-//     ±6 cent expressive detune. This eliminates the "siren" glissando
-//     between notes and gives the output a tonal, melodic backbone.
-//   - The default contour shape is "flat" (held tone, no in-syllable
-//     pitch variation). Other shapes (rise / fall / arch / dip / trill)
-//     are kept but rare; they preserve some bird character without
-//     swamping the melody.
-//   - Envelope is percussive (linear 4 ms attack, ~8 ms release) instead
-//     of soft exponential ⇒ a crisp "ictus" at each note.
+//   - Pitch is QUANTISED with MAGNETISM (~70 %) toward the nearest semitone.
+//     Soft pull rather than rigid snap — the melody is tonally clear but
+//     each note keeps a small expressive offset, so it doesn't sound like
+//     a tuner-locked synth.
+//   - Default contour shape is "flat", but flats now BREATHE (±4 cents
+//     slow drift across the syllable). No long sweep, just gentle
+//     instability — the difference between a held vocal note and a
+//     sustained synth tone.
+//   - Envelope is fast but NOT linear: exponential 5 ms attack and 10 ms
+//     release. Crisp ictus without the digital-step click of a linear
+//     ramp on amplitude.
 //   - Ornaments only at phrase ends, low base probability.
 //
 // Pipeline:
-//   YIN (covers voice + whistle) → median → octave-error correction
-//   → EMA smoothing → onset detection (energy AND pitch jumps)
-//   → for each onset: quantise to nearest semitone, pick contour shape,
-//     schedule grains
-//   → reverb / formant filter / limiter
+//   YIN → median → octave-error correction → EMA → onset detection
+//   (energy AND pitch jumps) → for each onset: magnetism-quantise, pick
+//   contour shape, schedule grains → reverb / formant / limiter
 
 const SOURCE_URL = "/whistle-source.ogg";
 const SOURCE_PITCH = 1500;
@@ -347,9 +347,6 @@ function detectOnsets(
   return merged;
 }
 
-// ── Contour shapes. "flat" is the new default — held anchor pitch with no
-// in-syllable variation. The melodic shape comes from sequencing different
-// flat anchors across syllables, not from sweeping pitch within a syllable.
 type ContourShape = "flat" | "rise" | "fall" | "arch" | "dip" | "trill";
 
 function makeRng(seed: number): () => number {
@@ -364,11 +361,8 @@ function makeRng(seed: number): () => number {
 }
 
 function pickShape(bird: BirdProfile, rng: () => number): ContourShape {
-  // Trill probability scales with warble, capped at 40 % for the highest.
   if (rng() < bird.warble * 0.4) return "trill";
-  // FLAT is the default. High-warble birds (uirapuru) get more variation.
   if (rng() < 0.85 - bird.warble * 0.35) return "flat";
-  // Remaining slice (~12-30 % depending on warble) spread across moving shapes.
   const r = rng();
   if (r < 0.3) return "rise";
   if (r < 0.55) return "fall";
@@ -383,13 +377,25 @@ function buildContour(
   anchorPitch: number,
   rng: () => number,
 ): { t: number; f: number }[] {
-  // For flat we just hold the anchor — a single straight line.
+  // ── Flat with breathing: held tone but with ±4 cents slow arc drift.
+  // Without breathing, the held note sounds like a sustained synth tone.
+  // The drift is too small to read as "movement", but big enough to feel
+  // alive — same trick a vocalist uses on a held note.
   if (shape === "flat") {
-    return [
-      { t: 0, f: anchorPitch },
-      { t: duration, f: anchorPitch },
-    ];
+    const breathCentsPeak = 4 * (rng() * 0.6 + 0.7); // 2.8 – 6.4 cents
+    const direction = rng() < 0.5 ? 1 : -1;
+    const N = 4;
+    const pts: { t: number; f: number }[] = [];
+    for (let i = 0; i <= N; i++) {
+      const u = i / N;
+      // Half-sine arch — peaks mid-syllable, returns near anchor at edges.
+      const cents = direction * breathCentsPeak * Math.sin(u * Math.PI);
+      const f = anchorPitch * Math.pow(2, cents / 1200);
+      pts.push({ t: u * duration, f });
+    }
+    return pts;
   }
+
   const center = anchorPitch * (0.97 + rng() * 0.06);
   const span = bird.pitchRange * (0.45 + rng() * 0.55);
   const lo = center - span / 2;
@@ -459,12 +465,18 @@ function interpolateContour(
   return contour[contour.length - 1].f;
 }
 
-/** Snap a frequency to the nearest semitone in 12-tone equal temperament. */
-function quantiseToSemitone(hz: number): number {
+/**
+ * Magnetism quantisation: pull the input pitch toward the nearest semitone
+ * by `magnetism` (0 = no quantisation, 1 = rigid snap). 0.7 leaves enough
+ * humanity that singers don't sound auto-tuned, while still pulling the
+ * melody onto recognisable notes.
+ */
+function quantiseToSemitone(hz: number, magnetism = 0.7): number {
   if (hz <= 0) return hz;
   const midi = 12 * Math.log2(hz / 440) + 69;
-  const rounded = Math.round(midi);
-  return 440 * Math.pow(2, (rounded - 69) / 12);
+  const target = Math.round(midi);
+  const blended = midi * (1 - magnetism) + target * magnetism;
+  return 440 * Math.pow(2, (blended - 69) / 12);
 }
 
 function createReverbIR(ctx: BaseAudioContext, durationSec = 1.2): AudioBuffer {
@@ -552,6 +564,7 @@ export async function translateToBird(
   const MAX_DUR = 0.18;
   const MIN_DUR = 0.06;
   const MIN_SILENCE = 0.04;
+  const QUANTISE_MAGNETISM = 0.7;
 
   for (let i = 0; i < onsets.length; i++) {
     const idx = onsets[i];
@@ -574,19 +587,16 @@ export async function translateToBird(
     const prevGap = i === 0 ? Infinity : start - onsets[i - 1] * hopSec;
     const isAccented = i === 0 || prevGap > meanIOI * 1.3;
     const isPhraseEnd = i === onsets.length - 1 || gap > meanIOI * 1.5;
-    // P4 tuned down: ornaments are now rare even on phrase ends
     const ornamentProb = 0.15 + bird.warble * 0.25;
     const wantOrnament = isPhraseEnd && dur > 0.10 && rng() < ornamentProb;
 
-    // P3 microtonality (applied AFTER quantisation so the syllable lands on
-    // a real note plus a small expressive offset, instead of drifting
-    // randomly through cracks between notes).
-    const detuneCents = (rng() - 0.5) * 12;
+    // Detune ±9 cents — wider than ±6 so adjacent same-note syllables drift
+    // audibly enough to feel human.
+    const detuneCents = (rng() - 0.5) * 18;
     const detuneRatio = Math.pow(2, detuneCents / 1200);
 
-    // ── Pitch quantisation: snap user pitch (transposed) to nearest semitone
     const transposed = userPitch * shiftFactor;
-    const quantised = quantiseToSemitone(transposed);
+    const quantised = quantiseToSemitone(transposed, QUANTISE_MAGNETISM);
     const anchorPitch = Math.min(
       4500,
       Math.max(800, quantised * detuneRatio),
@@ -662,23 +672,21 @@ export async function translateToBird(
     const sylEnv = offline.createGain();
     sylEnv.connect(highpass);
 
-    // P1+ — percussive envelope: linear ramps, sharp attack, sharp release.
-    // Was: exponential, 6-14 ms attack, 40 ms release. Now: 4 ms / 8 ms,
-    // both linear. This is what gives each note an "ictus" instead of an
-    // atmospheric fade.
-    const baseAttack = 0.004;
+    // Exponential ramps, fast but vocal — no derivative-step click on the
+    // amplitude. Attack 5 ms (3 ms when accented), release 10 ms.
+    const baseAttack = 0.005;
     const attack = syl.isAccented ? 0.003 : baseAttack;
-    const release = 0.008;
+    const release = 0.010;
 
     const peak = Math.min(0.6, 0.18 + syl.amplitude * 0.55) *
       (0.7 + 0.4 * Math.min(1, 0.18 / syl.duration));
-    sylEnv.gain.setValueAtTime(0, syl.start);
-    sylEnv.gain.linearRampToValueAtTime(peak, syl.start + attack);
+    sylEnv.gain.setValueAtTime(0.0001, syl.start);
+    sylEnv.gain.exponentialRampToValueAtTime(peak, syl.start + attack);
     sylEnv.gain.setValueAtTime(
       peak,
       syl.start + Math.max(attack, syl.duration - release),
     );
-    sylEnv.gain.linearRampToValueAtTime(0, syl.start + syl.duration);
+    sylEnv.gain.exponentialRampToValueAtTime(0.0001, syl.start + syl.duration);
 
     const numGrains = Math.max(2, Math.ceil(syl.duration / GRAIN_HOP) + 1);
     let sourcePos = (syl.start * 0.37) % sourceUsableLen;
