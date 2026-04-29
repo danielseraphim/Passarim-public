@@ -1,4 +1,4 @@
-// Brazilian-bird-inspired whistle synthesizer — HYBRID melody-as-anchor.
+// Brazilian-bird-inspired whistle synthesizer — HYBRID, MUSICALLY OPINIONATED.
 //
 // Onsets in the input drive syllable timings. At each onset we sample the
 // user's pitch and use it as the ANCHOR for a per-syllable bird-shaped
@@ -7,10 +7,20 @@
 // quality. Each syllable is rendered as overlapping grains of the user's
 // own whistle sample.
 //
-// Critical fix (this revision): YIN pitch range was set for sung voice
-// (70-500 Hz). Whistled input is 700-3000 Hz — completely outside that
-// range. Detection silently failed, melody was lost, output anchored to
-// defaults. Range now covers both voice and whistle.
+// Four "musician" passes layered on top of literal transliteration:
+//   P1 — Articulation: hard duration cap (180 ms), enforced 40 ms silence
+//        between syllables, fast attacks. Each note has a clear start and
+//        a clear end — no legato bleed.
+//   P2 — Ornamentation: only on syllables that ARE phrase ends (gap to
+//        next onset > 1.5 × local mean inter-onset interval), and only
+//        with probability proportional to bird.warble. A short semitone
+//        trill (~40 ms) is appended.
+//   P3 — Microtonality: each syllable's anchor pitch is randomly detuned
+//        by ±6 cents — small enough to feel alive, not so much that it
+//        sounds out of tune.
+//   P4 — Phrasal accent (option B heuristic): first onset and onsets
+//        following a longer-than-average gap get +25 % amplitude and a
+//        sharper attack.
 
 const SOURCE_URL = "/whistle-source.ogg";
 const SOURCE_PITCH = 1500;
@@ -50,73 +60,43 @@ export const BIRDS: Record<string, BirdProfile> = {
   bemtevi: {
     name: "Bem-te-vi",
     accent: "#F2C94C",
-    baseFreq: 2400,
-    pitchRange: 700,
-    trill: 4.0,
-    warble: 0.5,
-    formantFreq: 2800,
-    formantQ: 3.5,
-    attackHardness: 0.7,
+    baseFreq: 2400, pitchRange: 700, trill: 4.0, warble: 0.5,
+    formantFreq: 2800, formantQ: 3.5, attackHardness: 0.7,
     description: "O guardião da manhã, canto claro que abre o dia na natureza.",
   },
   sabia: {
     name: "Sabiá-laranjeira",
     accent: "#E67E22",
-    baseFreq: 2100,
-    pitchRange: 600,
-    trill: 3.5,
-    warble: 0.6,
-    formantFreq: 2400,
-    formantQ: 3.0,
-    attackHardness: 0.3,
+    baseFreq: 2100, pitchRange: 600, trill: 3.5, warble: 0.6,
+    formantFreq: 2400, formantQ: 3.0, attackHardness: 0.3,
     description: "Poeta da paisagem, seu canto é memória e tradição.",
   },
   uirapuru: {
     name: "Uirapuru",
     accent: "#E74C3C",
-    baseFreq: 2500,
-    pitchRange: 900,
-    trill: 7.0,
-    warble: 1.0,
-    formantFreq: 2700,
-    formantQ: 2.5,
-    attackHardness: 0.5,
+    baseFreq: 2500, pitchRange: 900, trill: 7.0, warble: 1.0,
+    formantFreq: 2700, formantQ: 2.5, attackHardness: 0.5,
     description: "Raro e misterioso, seu canto ecoa como encantamento da mata.",
   },
   azulao: {
     name: "Azulão",
     accent: "#2D7DD2",
-    baseFreq: 2200,
-    pitchRange: 400,
-    trill: 2.5,
-    warble: 0.3,
-    formantFreq: 2200,
-    formantQ: 4.5,
-    attackHardness: 0.4,
+    baseFreq: 2200, pitchRange: 400, trill: 2.5, warble: 0.3,
+    formantFreq: 2200, formantQ: 4.5, attackHardness: 0.4,
     description: "Força e beleza, seu canto é firme e marcante.",
   },
   tiesangue: {
     name: "Tiê-sangue",
     accent: "#6BAF6B",
-    baseFreq: 2800,
-    pitchRange: 500,
-    trill: 5.0,
-    warble: 0.5,
-    formantFreq: 3200,
-    formantQ: 4.0,
-    attackHardness: 0.7,
+    baseFreq: 2800, pitchRange: 500, trill: 5.0, warble: 0.5,
+    formantFreq: 3200, formantQ: 4.0, attackHardness: 0.7,
     description: "Pequeno notável, seu canto é alegria que contagia.",
   },
   sanhacu: {
     name: "Sanhaçu",
     accent: "#A48DBA",
-    baseFreq: 3000,
-    pitchRange: 500,
-    trill: 4.0,
-    warble: 0.6,
-    formantFreq: 3500,
-    formantQ: 3.0,
-    attackHardness: 0.6,
+    baseFreq: 3000, pitchRange: 500, trill: 4.0, warble: 0.6,
+    formantFreq: 3500, formantQ: 3.0, attackHardness: 0.6,
     description: "Cores que cantam, sua presença é pura vibração.",
   },
 };
@@ -234,7 +214,6 @@ function yinPitch(
     cmnd[tau] = run > 0 ? (diff[tau] * tau) / run : 1;
   }
   // Range covers both sung voice (~80-500 Hz) AND whistle (~700-3000 Hz).
-  // Without the upper extension, whistled input is completely missed.
   const minLag = Math.max(2, Math.floor(sampleRate / 3500));
   const maxLag = Math.min(halfN - 2, Math.floor(sampleRate / 80));
   if (maxLag <= minLag) return { f0: 0, conf: 0 };
@@ -387,6 +366,25 @@ function buildContour(
   return pts;
 }
 
+/** Append a brief semitone trill at the end of a contour (P2 ornament). */
+function appendOrnament(
+  contour: { t: number; f: number }[],
+  baseDuration: number,
+  anchorPitch: number,
+): { contour: { t: number; f: number }[]; newDuration: number } {
+  const ornDur = 0.045; // 45 ms tail
+  const semitoneRatio = Math.pow(2, 1 / 12);
+  // 4 quick alternations between anchor and anchor+semitone
+  const newPts = contour.slice();
+  const N = 5;
+  for (let k = 1; k <= N; k++) {
+    const t = baseDuration + (k / N) * ornDur;
+    const f = anchorPitch * (k % 2 === 0 ? 1 : semitoneRatio);
+    newPts.push({ t, f });
+  }
+  return { contour: newPts, newDuration: baseDuration + ornDur };
+}
+
 function interpolateContour(
   contour: { t: number; f: number }[],
   tInSyl: number,
@@ -422,6 +420,7 @@ type Syllable = {
   duration: number;
   amplitude: number;
   contour: { t: number; f: number }[];
+  isAccented: boolean;
 };
 
 export async function translateToBird(
@@ -433,8 +432,6 @@ export async function translateToBird(
   const duration = samples.length / sampleRate;
   if (duration < 0.05) return new Float32Array(0);
 
-  // Light decimation (×2) instead of ×4 — keeps high-frequency content for
-  // whistle pitch detection.
   const decimateFactor = sampleRate >= 32000 ? 2 : 1;
   const dec = decimate(samples, decimateFactor);
   const decRate = sampleRate / decimateFactor;
@@ -477,10 +474,26 @@ export async function translateToBird(
   const octaveShift = Math.round(Math.log2(bird.baseFreq / avgF0));
   const shiftFactor = Math.pow(2, octaveShift);
 
+  // ── P4: compute mean inter-onset interval (IOI) for accent detection ──
+  const iois: number[] = [];
+  for (let i = 1; i < onsets.length; i++) {
+    iois.push((onsets[i] - onsets[i - 1]) * hopSec);
+  }
+  const meanIOI =
+    iois.length > 0 ? iois.reduce((a, b) => a + b, 0) / iois.length : 0.3;
+
   const rng = makeRng(onsets.length * 1009 + Math.floor(bird.baseFreq));
   const syllables: Syllable[] = [];
+
+  // P1 — articulation parameters
+  const MAX_DUR = 0.18; // hard cap on syllable length
+  const MIN_DUR = 0.06;
+  const MIN_SILENCE = 0.04; // forced silence between syllables
+
   for (let i = 0; i < onsets.length; i++) {
     const idx = onsets[i];
+
+    // Sample user pitch around the onset (±100 ms).
     let userPitch = 0;
     for (let d = 0; d < 10 && userPitch === 0; d++) {
       if (idx + d < f0Smooth.length && f0Smooth[idx + d] > 0)
@@ -491,22 +504,47 @@ export async function translateToBird(
     if (userPitch === 0) userPitch = avgF0;
 
     const start = idx * hopSec;
-    const next = i + 1 < onsets.length ? onsets[i + 1] * hopSec : duration;
-    const dur = Math.min(0.32, Math.max(0.08, (next - start) * 0.85));
+    const nextStart =
+      i + 1 < onsets.length ? onsets[i + 1] * hopSec : duration;
+    const gap = nextStart - start;
 
-    // Wider clamp (800-4500 Hz) so whistled input doesn't get its upper
-    // notes flattened against a low ceiling.
+    // ── P1: articulation — short syllable with forced trailing silence
+    let dur = Math.min(MAX_DUR, Math.max(MIN_DUR, gap - MIN_SILENCE));
+
+    // ── P4: accent — first onset, or onset that follows a longer-than-mean gap
+    const prevGap = i === 0 ? Infinity : start - onsets[i - 1] * hopSec;
+    const isAccented = i === 0 || prevGap > meanIOI * 1.3;
+
+    // ── P2: ornamentation — only on phrase-end syllables
+    const isPhraseEnd = i === onsets.length - 1 || gap > meanIOI * 1.5;
+    const ornamentProb = 0.5 + bird.warble * 0.3;
+    const wantOrnament =
+      isPhraseEnd && dur > 0.10 && rng() < ornamentProb;
+
+    // ── P3: microtonality — ±6 cents per syllable (random, fixed for the syllable)
+    const detuneCents = (rng() - 0.5) * 12;
+    const detuneRatio = Math.pow(2, detuneCents / 1200);
+
     const anchorPitch = Math.min(
       4500,
-      Math.max(800, userPitch * shiftFactor),
+      Math.max(800, userPitch * shiftFactor * detuneRatio),
     );
     const shape = pickShape(bird, rng);
-    const contour = buildContour(shape, bird, dur, anchorPitch, rng);
-    const amplitude = Math.min(1, rmss[idx] / peakRms + 0.15);
+    let contour = buildContour(shape, bird, dur, anchorPitch, rng);
 
-    syllables.push({ start, duration: dur, amplitude, contour });
+    if (wantOrnament) {
+      const orn = appendOrnament(contour, dur, anchorPitch);
+      contour = orn.contour;
+      dur = orn.newDuration;
+    }
+
+    const amplitudeBase = Math.min(1, rmss[idx] / peakRms + 0.15);
+    const amplitude = isAccented ? Math.min(1, amplitudeBase * 1.25) : amplitudeBase;
+
+    syllables.push({ start, duration: dur, amplitude, contour, isAccented });
   }
 
+  // ── Render setup ──
   const reverbTail = 1.4;
   const totalLen = Math.floor((duration + reverbTail) * sampleRate);
   const offline = new OfflineAudioContext(1, totalLen, sampleRate);
@@ -555,24 +593,27 @@ export async function translateToBird(
   for (let i = 0; i < noiseData.length; i++) noiseData[i] = Math.random() * 2 - 1;
 
   const sourceUsableLen = Math.max(0.05, sourceBuffer.duration - 0.1);
-  const GRAIN_SIZE = 0.06;
-  const GRAIN_HOP = 0.022;
+  const GRAIN_SIZE = 0.05;
+  const GRAIN_HOP = 0.018;
 
   for (const syl of syllables) {
     const sylEnv = offline.createGain();
     sylEnv.connect(highpass);
 
-    const peak = Math.min(0.55, 0.18 + syl.amplitude * 0.5) *
+    // P1 — sharper attacks. Accented syllables get an even faster attack.
+    const baseAttack = 0.006 + (1 - bird.attackHardness) * 0.008; // 6-14 ms
+    const attack = syl.isAccented ? baseAttack * 0.6 : baseAttack;
+    const release = 0.04;
+
+    const peak = Math.min(0.6, 0.18 + syl.amplitude * 0.55) *
       (0.7 + 0.4 * Math.min(1, 0.18 / syl.duration));
-    const attack = 0.01 + (1 - bird.attackHardness) * 0.015;
-    const release = 0.045;
     sylEnv.gain.setValueAtTime(0.0001, syl.start);
     sylEnv.gain.exponentialRampToValueAtTime(peak, syl.start + attack);
     sylEnv.gain.setValueAtTime(
       peak,
       syl.start + Math.max(attack, syl.duration - release),
     );
-    sylEnv.gain.exponentialRampToValueAtTime(0.0001, syl.start + syl.duration + 0.05);
+    sylEnv.gain.exponentialRampToValueAtTime(0.0001, syl.start + syl.duration + 0.04);
 
     const numGrains = Math.max(2, Math.ceil(syl.duration / GRAIN_HOP) + 1);
     let sourcePos = (syl.start * 0.37) % sourceUsableLen;
@@ -599,6 +640,7 @@ export async function translateToBird(
       sourcePos = (sourcePos + 0.014) % sourceUsableLen;
     }
 
+    // Onset transient. Accented syllables get a louder transient.
     const noiseSrc = offline.createBufferSource();
     noiseSrc.buffer = noiseBuf;
     const noiseBp = offline.createBiquadFilter();
@@ -606,15 +648,14 @@ export async function translateToBird(
     noiseBp.frequency.value = 5500;
     noiseBp.Q.value = 1.6;
     const noiseGain = offline.createGain();
+    const transientPeak =
+      0.18 * bird.attackHardness * syl.amplitude * (syl.isAccented ? 1.4 : 1);
     noiseGain.gain.setValueAtTime(0, syl.start);
-    noiseGain.gain.linearRampToValueAtTime(
-      0.18 * bird.attackHardness * syl.amplitude,
-      syl.start + 0.003,
-    );
-    noiseGain.gain.exponentialRampToValueAtTime(0.001, syl.start + 0.03);
+    noiseGain.gain.linearRampToValueAtTime(transientPeak, syl.start + 0.003);
+    noiseGain.gain.exponentialRampToValueAtTime(0.001, syl.start + 0.025);
     noiseSrc.connect(noiseBp).connect(noiseGain).connect(limiter);
     noiseSrc.start(syl.start);
-    noiseSrc.stop(syl.start + 0.08);
+    noiseSrc.stop(syl.start + 0.06);
   }
 
   if (options.includeMic) {
