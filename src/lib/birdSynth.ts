@@ -1,26 +1,16 @@
 // Brazilian-bird-inspired whistle synthesizer — HYBRID melody-as-anchor.
 //
-// What changed: stopped continuously chasing the user's pitch (which made
-// the output sound like a theremin), and stopped picking random pitches per
-// syllable (which made the output ignore the melody). Instead:
+// Onsets in the input drive syllable timings. At each onset we sample the
+// user's pitch and use it as the ANCHOR for a per-syllable bird-shaped
+// contour (rise / fall / arch / dip / trill). Between syllables: silence,
+// no continuous pitch tracking — that's what eliminates the theremin
+// quality. Each syllable is rendered as overlapping grains of the user's
+// own whistle sample.
 //
-//   1. Detect onsets in the input — gives us syllable timings + rhythm.
-//   2. At each onset, SAMPLE the user's smoothed pitch — gives us a melody
-//      anchor for that syllable.
-//   3. Generate a bird-shaped per-syllable contour (rise / fall / arch /
-//      dip / trill) ANCHORED at the transposed user pitch. The contour
-//      shape is the bird's vocabulary, but its starting note follows the
-//      melody.
-//   4. Render each syllable as overlapping grains of the user's whistle
-//      sample — discrete syllables, real-whistle timbre, organic.
-//   5. BETWEEN syllables: silence. No continuous pitch tracking, so no
-//      theremin glide.
-//
-// Pipeline:
-//   YIN pitch tracking → median + EMA smooth → onset detection
-//   → for each onset: pick contour shape, anchor at user's pitch, schedule
-//     grains across the contour
-//   → reverb, formant filter, limiter
+// Critical fix (this revision): YIN pitch range was set for sung voice
+// (70-500 Hz). Whistled input is 700-3000 Hz — completely outside that
+// range. Detection silently failed, melody was lost, output anchored to
+// defaults. Range now covers both voice and whistle.
 
 const SOURCE_URL = "/whistle-source.ogg";
 const SOURCE_PITCH = 1500;
@@ -223,7 +213,7 @@ function decimate(samples: Float32Array, factor: number): Float32Array {
 function yinPitch(
   frame: Float32Array,
   sampleRate: number,
-  threshold = 0.15,
+  threshold = 0.12,
 ): { f0: number; conf: number } {
   const halfN = frame.length >> 1;
   if (halfN < 8) return { f0: 0, conf: 0 };
@@ -243,8 +233,10 @@ function yinPitch(
     run += diff[tau];
     cmnd[tau] = run > 0 ? (diff[tau] * tau) / run : 1;
   }
-  const minLag = Math.max(2, Math.floor(sampleRate / 500));
-  const maxLag = Math.min(halfN - 2, Math.floor(sampleRate / 70));
+  // Range covers both sung voice (~80-500 Hz) AND whistle (~700-3000 Hz).
+  // Without the upper extension, whistled input is completely missed.
+  const minLag = Math.max(2, Math.floor(sampleRate / 3500));
+  const maxLag = Math.min(halfN - 2, Math.floor(sampleRate / 80));
   if (maxLag <= minLag) return { f0: 0, conf: 0 };
 
   let tau = -1;
@@ -322,8 +314,6 @@ function detectOnsets(rmss: number[], hopSec: number): number[] {
       lastOnset = i;
     }
   }
-  // If the audio is mostly stationary (no clear peaks), fall back to a
-  // regular pulse so we still produce something.
   if (onsets.length === 0) {
     const totalDur = rmss.length * hopSec;
     const count = Math.max(3, Math.min(14, Math.round(totalDur / 0.35)));
@@ -333,12 +323,6 @@ function detectOnsets(rmss: number[], hopSec: number): number[] {
   }
   return onsets;
 }
-
-// ────────────────────────────────────────────────────────────────────────────
-// Per-syllable contour generator. The contour is what gives each syllable
-// its bird-like shape — anchored at a target pitch, drawn through one of
-// five archetypal trajectories.
-// ────────────────────────────────────────────────────────────────────────────
 
 type ContourShape = "rise" | "fall" | "arch" | "dip" | "trill";
 
@@ -362,12 +346,6 @@ function pickShape(bird: BirdProfile, rng: () => number): ContourShape {
   return "dip";
 }
 
-/**
- * Build (time, frequency) breakpoints for one syllable. The contour is
- * centred on `anchorPitch` (the user's transposed pitch at the onset moment)
- * and spans bird.pitchRange Hz. The shape of the trajectory is chosen
- * per-syllable from the bird's vocabulary.
- */
 function buildContour(
   shape: ContourShape,
   bird: BirdProfile,
@@ -409,7 +387,6 @@ function buildContour(
   return pts;
 }
 
-/** Linearly interpolate the contour at time `tInSyl` (0..duration). */
 function interpolateContour(
   contour: { t: number; f: number }[],
   tInSyl: number,
@@ -456,8 +433,9 @@ export async function translateToBird(
   const duration = samples.length / sampleRate;
   if (duration < 0.05) return new Float32Array(0);
 
-  // ── Pitch + onset analysis ──
-  const decimateFactor = sampleRate >= 32000 ? 4 : 2;
+  // Light decimation (×2) instead of ×4 — keeps high-frequency content for
+  // whistle pitch detection.
+  const decimateFactor = sampleRate >= 32000 ? 2 : 1;
   const dec = decimate(samples, decimateFactor);
   const decRate = sampleRate / decimateFactor;
   const frameLen = Math.floor(decRate * 0.04);
@@ -478,7 +456,7 @@ export async function translateToBird(
     if (rms > peakRms) peakRms = rms;
     if (rms < 0.005) continue;
     const { f0, conf } = yinPitch(frame, decRate);
-    if (conf > 0.5 && f0 > 70 && f0 < 600) f0s[i] = f0;
+    if (conf > 0.4 && f0 > 80 && f0 < 3500) f0s[i] = f0;
   }
 
   const f0Med = medianFilter(f0s, 7);
@@ -488,8 +466,6 @@ export async function translateToBird(
   const onsets = detectOnsets(rmss, hopSec);
   if (onsets.length === 0) return new Float32Array(0);
 
-  // Mean voiced F0 — used for the octave shift baseline. If the user is
-  // mostly unvoiced (drumming, traffic, etc.), fall back to bird.baseFreq.
   let voicedSum = 0,
     voicedCount = 0;
   for (const f of f0Smooth)
@@ -501,16 +477,10 @@ export async function translateToBird(
   const octaveShift = Math.round(Math.log2(bird.baseFreq / avgF0));
   const shiftFactor = Math.pow(2, octaveShift);
 
-  // ── Build syllables: rhythm from onsets, pitch ANCHOR from user's smoothed
-  // pitch at each onset, contour from bird's vocabulary. This is the move
-  // that breaks the theremin character: each syllable is its own
-  // self-contained pitch shape, anchored to the user's melody but not
-  // continuously tracking it.
   const rng = makeRng(onsets.length * 1009 + Math.floor(bird.baseFreq));
   const syllables: Syllable[] = [];
   for (let i = 0; i < onsets.length; i++) {
     const idx = onsets[i];
-    // Find nearest voiced pitch (search a window around the onset).
     let userPitch = 0;
     for (let d = 0; d < 10 && userPitch === 0; d++) {
       if (idx + d < f0Smooth.length && f0Smooth[idx + d] > 0)
@@ -518,16 +488,17 @@ export async function translateToBird(
       else if (idx - d >= 0 && f0Smooth[idx - d] > 0)
         userPitch = f0Smooth[idx - d];
     }
-    if (userPitch === 0) userPitch = avgF0; // unvoiced section — fall back
+    if (userPitch === 0) userPitch = avgF0;
 
     const start = idx * hopSec;
-    const next =
-      i + 1 < onsets.length ? onsets[i + 1] * hopSec : duration;
+    const next = i + 1 < onsets.length ? onsets[i + 1] * hopSec : duration;
     const dur = Math.min(0.32, Math.max(0.08, (next - start) * 0.85));
 
+    // Wider clamp (800-4500 Hz) so whistled input doesn't get its upper
+    // notes flattened against a low ceiling.
     const anchorPitch = Math.min(
-      3200,
-      Math.max(900, userPitch * shiftFactor),
+      4500,
+      Math.max(800, userPitch * shiftFactor),
     );
     const shape = pickShape(bird, rng);
     const contour = buildContour(shape, bird, dur, anchorPitch, rng);
@@ -536,7 +507,6 @@ export async function translateToBird(
     syllables.push({ start, duration: dur, amplitude, contour });
   }
 
-  // ── Render setup ──
   const reverbTail = 1.4;
   const totalLen = Math.floor((duration + reverbTail) * sampleRate);
   const offline = new OfflineAudioContext(1, totalLen, sampleRate);
@@ -580,7 +550,6 @@ export async function translateToBird(
   lowpass.frequency.value = 7000;
   highpass.connect(formant).connect(lowpass).connect(limiter);
 
-  // Noise buffer used for transient bursts at each onset.
   const noiseBuf = offline.createBuffer(1, Math.floor(0.08 * sampleRate), sampleRate);
   const noiseData = noiseBuf.getChannelData(0);
   for (let i = 0; i < noiseData.length; i++) noiseData[i] = Math.random() * 2 - 1;
@@ -589,11 +558,7 @@ export async function translateToBird(
   const GRAIN_SIZE = 0.06;
   const GRAIN_HOP = 0.022;
 
-  // ── Render each syllable ──
   for (const syl of syllables) {
-    // Per-syllable amplitude envelope. Fast attack, exp decay. Each syllable
-    // has its OWN gain node so they're independent and don't trample each
-    // other's schedules.
     const sylEnv = offline.createGain();
     sylEnv.connect(highpass);
 
@@ -609,8 +574,6 @@ export async function translateToBird(
     );
     sylEnv.gain.exponentialRampToValueAtTime(0.0001, syl.start + syl.duration + 0.05);
 
-    // Schedule grains across the syllable duration. Each grain's
-    // playbackRate follows the contour at that point in time.
     const numGrains = Math.max(2, Math.ceil(syl.duration / GRAIN_HOP) + 1);
     let sourcePos = (syl.start * 0.37) % sourceUsableLen;
     for (let g = 0; g < numGrains; g++) {
@@ -619,14 +582,13 @@ export async function translateToBird(
 
       const u = Math.min(1, tInSyl / Math.max(0.001, syl.duration));
       const contourPitch = interpolateContour(syl.contour, u * syl.duration);
-      const playbackRate = Math.min(3.5, Math.max(0.5, contourPitch / SOURCE_PITCH));
+      const playbackRate = Math.min(4.0, Math.max(0.4, contourPitch / SOURCE_PITCH));
 
       const tAbs = syl.start + tInSyl;
       const grain = offline.createBufferSource();
       grain.buffer = sourceBuffer;
       grain.playbackRate.value = playbackRate;
 
-      // Hann-like grain window
       const grainGain = offline.createGain();
       grainGain.gain.setValueAtTime(0.0001, tAbs);
       grainGain.gain.linearRampToValueAtTime(1, tAbs + GRAIN_SIZE / 2);
@@ -637,9 +599,6 @@ export async function translateToBird(
       sourcePos = (sourcePos + 0.014) % sourceUsableLen;
     }
 
-    // Onset transient: short bandpass-noise burst at the start of the
-    // syllable for articulation crispness. Goes around the formant filter
-    // (so it doesn't get the bird's tonal colour, just sits as a "tk").
     const noiseSrc = offline.createBufferSource();
     noiseSrc.buffer = noiseBuf;
     const noiseBp = offline.createBiquadFilter();
