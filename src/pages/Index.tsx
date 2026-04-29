@@ -9,7 +9,7 @@ const Index = () => {
             Passarim
           </h1>
           <p className="mx-auto mt-4 max-w-md text-base text-muted-foreground md:text-lg">
-            Grave um som e ouça como ele soaria no canto de um pássaro brasileiro.
+            Grave um som e ouça como ele soaria no assobio de um pássaro brasileiro.
           </p>
         </header>
 
@@ -18,7 +18,7 @@ const Index = () => {
         </div>
 
         <p className="mt-10 text-center font-serif text-sm italic text-muted-foreground">
-          Da sua voz, um novo canto.
+          Da sua voz, um novo assobio.
         </p>
       </div>
     </main>
