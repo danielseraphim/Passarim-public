@@ -151,6 +151,27 @@ All colors MUST be HSL.
   0%, 100% { transform: scaleY(0.35); }
   50% { transform: scaleY(1); }
 }
+@keyframes breath {
+  0%, 100% {
+    transform: scale(1);
+    box-shadow: 0 0 0 0 hsl(var(--leaf) / 0.45), 0 12px 32px -8px hsl(var(--canopy-deep) / 0.45);
+  }
+  50% {
+    transform: scale(1.04);
+    box-shadow: 0 0 0 16px hsl(var(--leaf) / 0), 0 18px 44px -10px hsl(var(--canopy-deep) / 0.55);
+  }
+}
+@keyframes leaf-sway {
+  0%, 100% { transform: translateY(0) rotate(-3deg); }
+  50% { transform: translateY(-8px) rotate(2deg); }
+}
+@keyframes wave-flow {
+  0% { stroke-dashoffset: 0; }
+  100% { stroke-dashoffset: -100; }
+}
 .animate-pulse-ring { animation: pulse-ring 2s ease-out infinite; }
 .animate-float-slow { animation: float-slow 6s ease-in-out infinite; }
 .animate-shimmer { animation: shimmer 3s ease-in-out infinite; }
+.animate-breath { animation: breath 3.6s ease-in-out infinite; }
+.animate-leaf-sway { animation: leaf-sway 7s ease-in-out infinite; }
+.animate-wave-flow { animation: wave-flow 4s linear infinite; }

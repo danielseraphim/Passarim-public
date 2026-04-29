@@ -29,10 +29,10 @@ const WhatsAppIcon = ({ className }: { className?: string }) => (
   </svg>
 );
 
-/** Tiny leaf flourish used as decorative divider. */
-const LeafFlourish = ({ className }: { className?: string }) => (
-  <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" className={className}>
-    <path d="M12 2c-3 4-6 6-6 11 0 4 3 7 6 9 3-2 6-5 6-9 0-5-3-7-6-11Zm0 5c1.5 2 3 3.5 3 6 0 2-1.5 3.5-3 4.5-1.5-1-3-2.5-3-4.5 0-2.5 1.5-4 3-6Z" />
+const LeafSprig = ({ className }: { className?: string }) => (
+  <svg viewBox="0 0 30 14" fill="none" stroke="currentColor" aria-hidden="true" className={className}>
+    <path d="M 1 7 Q 8 3, 15 7 T 29 7" strokeWidth="1.2" strokeLinecap="round" opacity="0.6" />
+    <path d="M 12 4 C 14 5, 16 6, 18 7 C 16 8, 14 9, 12 10 Z" fill="currentColor" opacity="0.55" stroke="none" />
   </svg>
 );
 
@@ -209,123 +209,192 @@ export const BirdTranslator = () => {
   const isTranslating = stage === "translating";
   const hasResult = stage === "result";
 
-  const statusText =
+  const statusLabel =
     stage === "idle"
       ? "Pronto para gravar"
       : isRecording
         ? `Gravando · ${recordSeconds}s`
         : isTranslating
-          ? "Traduzindo para pássaro…"
+          ? "Traduzindo para pássaro"
           : "Tradução pronta";
 
-  const hintText =
+  const statusTagline =
     stage === "idle"
-      ? "Clique no microfone e cante uma melodia"
+      ? "Clique e cante uma melodia."
       : isRecording
-        ? "Clique no quadrado para parar e traduzir"
+        ? "A natureza está escutando."
         : isTranslating
           ? "Preparando o assobio…"
-          : "Clique no play para ouvir o pássaro";
+          : "Seu som virou canto.";
 
   return (
     <div className="w-full">
-      <div className="relative overflow-hidden rounded-[28px] bg-canopy p-6 text-primary-foreground shadow-card md:p-8">
-        <Waveform
-          level={isRecording ? level : hasResult ? 0.5 : 0}
-          active={isRecording || hasResult}
-          variant="dark"
-          className="mb-6"
+      <div
+        className="
+          relative overflow-hidden rounded-[36px]
+          bg-[hsl(var(--canopy-deep))]
+          p-6 md:p-9
+          text-primary-foreground shadow-card
+          ring-1 ring-white/5
+        "
+        style={{
+          backgroundImage:
+            "radial-gradient(circle at 20% 0%, hsl(var(--leaf) / 0.18), transparent 55%), radial-gradient(circle at 100% 100%, hsl(var(--canopy) / 0.6), transparent 60%)",
+        }}
+      >
+        {/* Soft inner glow */}
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-0 rounded-[36px] ring-1 ring-inset ring-white/5"
+          style={{ boxShadow: "inset 0 1px 0 hsl(var(--leaf) / 0.18)" }}
         />
 
-        <div className="flex items-center justify-between gap-4">
-          <div className="flex min-w-0 items-center gap-2 text-sm text-primary-foreground/85">
-            <span
-              className={`h-2 w-2 shrink-0 rounded-full ${
-                isRecording
-                  ? "bg-destructive animate-shimmer"
-                  : isTranslating
-                    ? "bg-[hsl(var(--leaf))] animate-shimmer"
-                    : hasResult
-                      ? "bg-[hsl(var(--leaf))]"
-                      : "bg-primary-foreground/40"
-              }`}
-            />
-            <span className="truncate font-medium">{statusText}</span>
+        {/* Organic waveform */}
+        <Waveform
+          level={isRecording ? level : hasResult ? 0.55 : 0.15}
+          active={isRecording || hasResult}
+          variant="dark"
+          className="relative mb-7"
+        />
+
+        {/* Status + main control + bird selector */}
+        <div className="relative flex items-center justify-between gap-4">
+          {/* LEFT: status (label + tagline) */}
+          <div className="flex min-w-0 flex-1 flex-col gap-1">
+            <div className="flex items-center gap-2 text-xs uppercase tracking-[0.22em] text-primary-foreground/75">
+              <span
+                className={`h-2 w-2 shrink-0 rounded-full ${
+                  isRecording
+                    ? "bg-destructive animate-shimmer"
+                    : isTranslating
+                      ? "bg-[hsl(var(--leaf))] animate-shimmer"
+                      : hasResult
+                        ? "bg-[hsl(var(--leaf))]"
+                        : "bg-primary-foreground/40"
+                }`}
+              />
+              <span className="truncate">{statusLabel}</span>
+            </div>
+            <div className="font-serif text-base italic text-primary-foreground/90 md:text-lg">
+              {statusTagline.split(" ").slice(0, -1).join(" ")}{" "}
+              <span className="text-[hsl(var(--leaf))] not-italic font-medium">
+                {statusTagline.split(" ").slice(-1)[0]}
+              </span>
+              <LeafSprig className="ml-2 inline-block h-3 w-6 align-middle text-[hsl(var(--leaf))]" />
+            </div>
           </div>
 
-          {/* Main action button */}
-          {isTranslating ? (
-            <div className="flex h-20 w-20 items-center justify-center rounded-full bg-[hsl(var(--cream))] text-canopy shadow-glow">
-              <Loader2 className="h-7 w-7 animate-spin" />
-            </div>
-          ) : hasResult ? (
-            <button
-              onClick={playBird}
-              aria-label="Ouvir tradução"
-              className="relative flex h-20 w-20 items-center justify-center rounded-full bg-[hsl(var(--leaf))] text-canopy shadow-glow transition-transform hover:scale-105 active:scale-95"
-            >
-              <Play className="h-7 w-7 fill-current" />
-            </button>
-          ) : (
-            <button
-              onClick={isRecording ? stopAndTranslate : startRecording}
-              aria-label={isRecording ? "Parar gravação" : "Começar a gravar"}
-              className="relative flex h-20 w-20 items-center justify-center rounded-full bg-[hsl(var(--cream))] text-canopy shadow-glow transition-transform hover:scale-105 active:scale-95"
-            >
-              {isRecording && (
-                <span className="absolute inset-0 rounded-full bg-destructive/40 animate-pulse-ring" />
-              )}
-              {isRecording ? (
-                <Square className="h-6 w-6 fill-current" />
-              ) : (
-                <Mic className="h-7 w-7" strokeWidth={2.2} />
-              )}
-            </button>
-          )}
-
-          {/* Bird selector — bird icon + name */}
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
+          {/* CENTER: main button — with leaf flourishes flanking it */}
+          <div className="relative flex items-center justify-center gap-2">
+            <LeafSprig className="hidden h-3 w-7 -scale-x-100 text-[hsl(var(--leaf))]/60 md:block" />
+            {isTranslating ? (
+              <div className="flex h-24 w-24 items-center justify-center rounded-full bg-[hsl(var(--leaf))] text-canopy shadow-glow">
+                <Loader2 className="h-9 w-9 animate-spin" />
+              </div>
+            ) : hasResult ? (
               <button
-                disabled={isRecording || isTranslating}
-                className="flex items-center gap-2 rounded-full border border-primary-foreground/20 bg-primary-foreground/5 py-1.5 pl-1.5 pr-3 text-sm hover:bg-primary-foreground/10 disabled:opacity-50"
+                onClick={playBird}
+                aria-label="Ouvir tradução"
+                className="
+                  relative flex h-24 w-24 items-center justify-center rounded-full
+                  bg-[hsl(var(--leaf))] text-canopy
+                  transition-transform hover:scale-105 active:scale-95
+                  animate-breath
+                "
               >
-                <span className="flex h-7 w-7 items-center justify-center rounded-full bg-[hsl(var(--cream))] text-canopy">
-                  <BirdIcon birdKey={birdKey} className="h-5 w-5" />
-                </span>
-                <span className="font-medium">{bird.name}</span>
-                <ChevronDown className="h-3.5 w-3.5 opacity-70" />
+                <Play className="h-9 w-9 fill-current" />
               </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-64">
-              {(Object.keys(BIRDS) as BirdKey[]).map((k) => {
-                const b = BIRDS[k];
-                return (
-                  <DropdownMenuItem
-                    key={k}
-                    onClick={() => {
-                      setBirdKey(k);
-                      if (hasResult) retranslate({ bird: b });
-                    }}
-                    className="gap-3"
+            ) : (
+              <button
+                onClick={isRecording ? stopAndTranslate : startRecording}
+                aria-label={isRecording ? "Parar gravação" : "Começar a gravar"}
+                className={`
+                  relative flex h-24 w-24 items-center justify-center rounded-full
+                  bg-[hsl(var(--cream))] text-canopy shadow-glow
+                  transition-transform hover:scale-105 active:scale-95
+                  ${!isRecording ? "animate-breath" : ""}
+                `}
+              >
+                {isRecording && (
+                  <span className="absolute inset-0 rounded-full bg-destructive/40 animate-pulse-ring" />
+                )}
+                {isRecording ? (
+                  <Square className="h-7 w-7 fill-current" />
+                ) : (
+                  <Mic className="h-9 w-9" strokeWidth={2.0} />
+                )}
+              </button>
+            )}
+            <LeafSprig className="hidden h-3 w-7 text-[hsl(var(--leaf))]/60 md:block" />
+          </div>
+
+          {/* RIGHT: bird selector */}
+          <div className="flex flex-1 justify-end">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  disabled={isRecording || isTranslating}
+                  className="
+                    flex items-center gap-2 rounded-full
+                    border border-primary-foreground/20 bg-primary-foreground/5
+                    py-1.5 pl-1.5 pr-3 text-sm
+                    hover:bg-primary-foreground/10 disabled:opacity-50
+                  "
+                >
+                  <span
+                    className="flex h-9 w-9 items-center justify-center rounded-full text-canopy"
+                    style={{ backgroundColor: "hsl(var(--cream))" }}
                   >
-                    <span className="flex h-8 w-8 items-center justify-center rounded-full bg-[hsl(var(--cream))] text-canopy">
-                      <BirdIcon birdKey={k} className="h-6 w-6" />
-                    </span>
-                    <span className="flex-1">{b.name}</span>
-                  </DropdownMenuItem>
-                );
-              })}
-            </DropdownMenuContent>
-          </DropdownMenu>
+                    <BirdIcon birdKey={birdKey} className="h-7 w-7" noHalo />
+                  </span>
+                  <span className="font-medium">{bird.name}</span>
+                  <ChevronDown className="h-3.5 w-3.5 opacity-70" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-72 p-1.5">
+                {(Object.keys(BIRDS) as BirdKey[]).map((k) => {
+                  const b = BIRDS[k];
+                  return (
+                    <DropdownMenuItem
+                      key={k}
+                      onClick={() => {
+                        setBirdKey(k);
+                        if (hasResult) retranslate({ bird: b });
+                      }}
+                      className="gap-3 py-2"
+                    >
+                      <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[hsl(var(--cream))] text-canopy">
+                        <BirdIcon birdKey={k} className="h-8 w-8" noHalo />
+                      </span>
+                      <div className="flex-1">
+                        <div className="font-medium">{b.name}</div>
+                        <div className="text-[11px] text-muted-foreground">
+                          {b.description}
+                        </div>
+                      </div>
+                    </DropdownMenuItem>
+                  );
+                })}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
         </div>
 
-        {/* Hint + voice toggle */}
-        <div className="mt-6 flex flex-col items-center gap-4 border-t border-primary-foreground/10 pt-5">
-          <span className="text-center text-[11px] uppercase tracking-[0.28em] text-primary-foreground/55">
-            {hintText}
-          </span>
+        {/* "OUÇA COMO FICOU" divider — only visible when there's a result */}
+        {hasResult && (
+          <div className="relative mt-7 flex items-center gap-3 text-primary-foreground/55">
+            <span className="h-px flex-1 bg-primary-foreground/20" />
+            <span className="flex items-center gap-2 text-[10px] uppercase tracking-[0.34em]">
+              <LeafSprig className="h-3 w-5 text-[hsl(var(--leaf))]" />
+              Ouça como ficou
+              <LeafSprig className="h-3 w-5 -scale-x-100 text-[hsl(var(--leaf))]" />
+            </span>
+            <span className="h-px flex-1 bg-primary-foreground/20" />
+          </div>
+        )}
 
+        {/* Voice toggle — always visible */}
+        <div className="relative mt-6 flex flex-col items-center gap-3">
           <div className="flex items-center gap-3 rounded-full border border-primary-foreground/15 bg-primary-foreground/5 px-4 py-2">
             <Switch
               id="include-mic"
@@ -345,21 +414,10 @@ export const BirdTranslator = () => {
           </div>
         </div>
 
-        {/* Result actions */}
+        {/* Result actions — audio + share + reset */}
         {hasResult && audioUrl && (
-          <div className="mt-6 flex flex-col items-center gap-4">
-            {/* Decorative "Ouça como ficou" divider */}
-            <div className="flex w-full items-center gap-3 text-primary-foreground/55">
-              <span className="h-px flex-1 bg-primary-foreground/20" />
-              <span className="flex items-center gap-2 text-[10px] uppercase tracking-[0.32em]">
-                <LeafFlourish className="h-3 w-3 text-[hsl(var(--leaf))]" />
-                Ouça como ficou
-                <LeafFlourish className="h-3 w-3 text-[hsl(var(--leaf))]" />
-              </span>
-              <span className="h-px flex-1 bg-primary-foreground/20" />
-            </div>
-
-            <audio src={audioUrl} controls className="w-full" />
+          <div className="relative mt-5 flex flex-col items-center gap-4">
+            <audio src={audioUrl} controls className="w-full max-w-lg" />
             <div className="flex flex-wrap items-center justify-center gap-3">
               <Button
                 onClick={shareOnWhatsApp}
