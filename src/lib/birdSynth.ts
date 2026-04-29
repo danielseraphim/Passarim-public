@@ -1,22 +1,25 @@
-// Brazilian-bird-inspired whistle synthesizer — melody-follower edition,
-// calibrated against real human-whistle recordings, with breath noise +
-// synthetic reverb to add the organic / spatial feel that pure-synth
-// whistles lack.
+// Brazilian-bird-inspired whistle synthesizer — articulated melody-follower.
 //
-// Targets measured from 18 reference whistles:
-//   - F0 around 1500 Hz (typical 1200-1800)
-//   - Vibrato rate ~3 Hz, depth ~80-150 Hz peak
-//   - Essentially zero harmonic content (pure sine)
+// History of this file: started as a syllable-only synth that didn't follow
+// melody, then became a pure melody-follower that sounded like a theremin,
+// now combines both — the user's vocal melody drives the pitch contour, but
+// detected onsets in the input retrigger sharp attacks, brief noise
+// transients, and ascending pitch chirps so each "note" feels articulated
+// the way a real bird's syllable does. A 10 Hz tremolo on the global
+// envelope adds the rapid amplitude modulation that birds have and
+// theremins lack.
 //
-// Signal chain:
-//   oscillator (sine, slow vibrato + noise pitch jitter)
-//      ↓ summed with breath noise (bandpass-filtered, gated by envelope)
-//   envelope (per-frame, follows voiced/unvoiced)
-//      ↓
-//   limiter (safety)
-//      ↓ ┐ dry path (direct)
-//        └ wet path → ConvolverNode (synthetic IR, ~1.2 s decay)
-//      ↓ both summed at master gain → output
+// Pipeline:
+//   1. Decimate audio (×4) and run YIN per frame.
+//   2. Median (window 7) + EMA smoothing on the F0 contour.
+//   3. Detect onsets (rising-edge peaks in the smoothed RMS envelope).
+//   4. Octave-shift to land near each bird's baseFreq.
+//   5. Render: sine osc + slow vibrato + low-passed-noise pitch jitter.
+//      At every onset: fast attack (5 ms), bandpass-noise burst, pitch chirp
+//      from -15 % up to target. Global tremolo modulates the envelope
+//      between onsets so even sustained tones have the rapid amplitude
+//      wobble of a real bird call.
+//   6. Dry/wet → master with synthetic mono reverb.
 
 export type BirdProfile = {
   name: string;
@@ -256,15 +259,46 @@ function emaSmooth(arr: number[], alpha = 0.4): number[] {
 }
 
 /**
- * Low-passed white noise buffer used to modulate the oscillator's pitch.
- * Gives the irregular wobble that human breath/lip variation produces.
+ * Detect onsets — rising-edge peaks in the smoothed RMS envelope. Returns
+ * frame indices. We use these to retrigger sharp attacks + noise transients
+ * + pitch chirps so the output has the per-syllable articulation that
+ * differentiates a bird from a theremin.
  */
+function detectOnsets(rmss: number[], hopSec: number): number[] {
+  if (rmss.length < 4) return [];
+  // Smooth slightly so we don't trigger on micro-jitter.
+  const sm = new Array(rmss.length);
+  let s = 0;
+  for (let i = 0; i < rmss.length; i++) {
+    s = 0.55 * s + 0.45 * rmss[i];
+    sm[i] = s;
+  }
+  let peak = 1e-6;
+  for (const v of sm) if (v > peak) peak = v;
+  const threshold = peak * 0.18;
+  const refractoryFrames = Math.max(4, Math.floor(0.09 / hopSec)); // ~90 ms
+  const onsets: number[] = [];
+  let lastOnset = -refractoryFrames;
+  for (let i = 1; i < sm.length - 1; i++) {
+    if (i - lastOnset < refractoryFrames) continue;
+    // Peak with a clear rising edge: at least +30 % over the previous frame.
+    if (
+      sm[i] > threshold &&
+      sm[i] > sm[i - 1] * 1.3 &&
+      sm[i] >= sm[i + 1]
+    ) {
+      onsets.push(i);
+      lastOnset = i;
+    }
+  }
+  return onsets;
+}
+
 function makeNoiseModBuffer(ctx: OfflineAudioContext, durationSec: number): AudioBuffer {
   const n = Math.max(1, Math.floor(ctx.sampleRate * durationSec));
   const buf = ctx.createBuffer(1, n, ctx.sampleRate);
   const data = buf.getChannelData(0);
   for (let i = 0; i < n; i++) data[i] = Math.random() * 2 - 1;
-  // 1-pole low-pass (~6 Hz cutoff).
   const dt = 1 / ctx.sampleRate;
   const fc = 6;
   const rc = 1 / (2 * Math.PI * fc);
@@ -280,20 +314,12 @@ function makeNoiseModBuffer(ctx: OfflineAudioContext, durationSec: number): Audi
   return buf;
 }
 
-/**
- * Generate a synthetic monaural impulse response for a small "outdoor"
- * reverb. Decaying coloured noise — fast initial decay, longer tail.
- * Used by the ConvolverNode to give the dry whistle a sense of being
- * recorded in a real space.
- */
 function createReverbIR(ctx: BaseAudioContext, durationSec = 1.2): AudioBuffer {
   const sampleRate = ctx.sampleRate;
   const length = Math.floor(sampleRate * durationSec);
   const impulse = ctx.createBuffer(1, length, sampleRate);
   const data = impulse.getChannelData(0);
   for (let i = 0; i < length; i++) {
-    // Exponentially-decaying noise. The (1 - i/length)^4 envelope gives a
-    // dense early reflection followed by a long, soft tail.
     const env = Math.pow(1 - i / length, 4);
     data[i] = (Math.random() * 2 - 1) * env;
   }
@@ -343,19 +369,19 @@ export async function translateToBird(
       voicedSum += f;
       voicedCount++;
     }
-
   if (voicedCount < 3) return makeSilenceChirp(sampleRate, bird);
 
   const avgF0 = voicedSum / voicedCount;
   const octaveShift = Math.round(Math.log2(bird.baseFreq / avgF0));
   const shiftFactor = Math.pow(2, octaveShift);
 
-  // Add tail for the reverb decay to fade out naturally.
+  const hopSec = hop / decRate;
+  const onsetFrames = new Set(detectOnsets(rmss, hopSec));
+
   const reverbTail = 1.4;
   const totalLen = Math.floor((duration + reverbTail) * sampleRate);
   const offline = new OfflineAudioContext(1, totalLen, sampleRate);
 
-  // Safety limiter at the input of the master bus.
   const limiter = offline.createDynamicsCompressor();
   limiter.threshold.value = -1;
   limiter.knee.value = 3;
@@ -367,46 +393,39 @@ export async function translateToBird(
   master.gain.value = 0.45;
   master.connect(offline.destination);
 
-  // Dry path: limiter → master.
+  // Dry path
   limiter.connect(master);
-
-  // Wet path: limiter → convolver → reverbGain → master. The synthetic IR
-  // simulates an open garden / forest with ~1.2 s of decay.
+  // Wet path: reverb
   const convolver = offline.createConvolver();
   convolver.buffer = createReverbIR(offline, 1.2);
   const reverbGain = offline.createGain();
-  reverbGain.gain.value = 0.3;
+  reverbGain.gain.value = 0.28;
   limiter.connect(convolver).connect(reverbGain).connect(master);
 
   // ── Whistle voice ──
   const osc = offline.createOscillator();
   osc.type = "sine";
 
-  // Slow vibrato (~3 Hz), measured profile of real whistles.
+  // Slow vibrato.
   const lfo = offline.createOscillator();
   lfo.type = "sine";
   lfo.frequency.value = bird.trill;
   const lfoDepth = offline.createGain();
-  lfoDepth.gain.value = bird.warble * 80;
+  lfoDepth.gain.value = bird.warble * 70;
   lfo.connect(lfoDepth);
   lfoDepth.connect(osc.frequency);
 
-  // Filtered-noise pitch jitter — natural breath/lip micro-wobble.
+  // Pitch jitter (filtered noise) — natural micro-wobble.
   const noiseModBuf = makeNoiseModBuffer(offline, Math.min(2.0, duration + 0.5));
   const noiseSrc = offline.createBufferSource();
   noiseSrc.buffer = noiseModBuf;
   noiseSrc.loop = true;
   const noiseDepth = offline.createGain();
-  noiseDepth.gain.value = bird.warble * 30;
+  noiseDepth.gain.value = bird.warble * 25;
   noiseSrc.connect(noiseDepth);
   noiseDepth.connect(osc.frequency);
 
-  // ── Breath texture ──
-  // White noise → bandpass (centred ~3.5 kHz, broad) → small gain → same
-  // envelope as the oscillator. This adds the airy texture of a real
-  // creature pushing breath through a beak/syringe. Gating through `env`
-  // means the breath is only present when the bird is "singing" — no
-  // background hiss between phrases.
+  // ── Breath texture (sustained hiss gated by main envelope) ──
   const breathBuf = offline.createBuffer(1, totalLen, sampleRate);
   const breathData = breathBuf.getChannelData(0);
   for (let i = 0; i < totalLen; i++) breathData[i] = Math.random() * 2 - 1;
@@ -417,29 +436,76 @@ export async function translateToBird(
   breathFilter.frequency.value = 3500;
   breathFilter.Q.value = 0.5;
   const breathGain = offline.createGain();
-  breathGain.gain.value = 0.06;
+  breathGain.gain.value = 0.05;
 
-  // ── Envelope (shared by oscillator and breath) ──
+  // ── Main envelope (voiced/unvoiced gate) ──
   const env = offline.createGain();
   env.gain.setValueAtTime(0, 0);
 
+  // ── Tremolo: ~10 Hz amplitude wobble multiplying the main envelope.
+  // This is what most distinguishes "bird singing a melody" from "theremin
+  // playing a melody" — birds have fast amplitude modulation, theremins
+  // don't. We modulate a separate gain stage so the tremolo is always
+  // proportional to the current envelope value (silent stays silent).
+  const tremoloGain = offline.createGain();
+  tremoloGain.gain.value = 1.0;
+  const tremolo = offline.createOscillator();
+  tremolo.type = "sine";
+  tremolo.frequency.value = 9.5;
+  const tremoloDepth = offline.createGain();
+  tremoloDepth.gain.value = 0.18; // ±18 % AM
+  tremolo.connect(tremoloDepth).connect(tremoloGain.gain);
+
   osc.connect(env);
   breathSrc.connect(breathFilter).connect(breathGain).connect(env);
+  env.connect(tremoloGain).connect(limiter);
 
-  env.connect(limiter);
+  // ── Transient noise burst, fired at every onset (consonant of articulation).
+  // One always-on bandpass-noise source with a gain that's normally 0;
+  // we schedule sharp spikes at each onset time.
+  const transientSrc = offline.createBufferSource();
+  transientSrc.buffer = breathBuf; // reuse the white noise buffer
+  const transientFilter = offline.createBiquadFilter();
+  transientFilter.type = "bandpass";
+  transientFilter.frequency.value = 5500;
+  transientFilter.Q.value = 1.6;
+  const transientGain = offline.createGain();
+  transientGain.gain.setValueAtTime(0, 0);
+  transientSrc.connect(transientFilter).connect(transientGain).connect(limiter);
 
   osc.frequency.setValueAtTime(bird.baseFreq, 0);
 
-  const hopSec = hop / decRate;
-  const envTau = 0.025;
+  const envTau = 0.024;
+
   for (let i = 0; i < numFrames; i++) {
     const t = i * hopSec;
     const f = f0Smooth[i];
     if (f > 0) {
       const birdF = Math.min(2900, Math.max(800, f * shiftFactor));
-      osc.frequency.linearRampToValueAtTime(birdF, t + hopSec);
       const targetGain = Math.min(0.55, (rmss[i] / peakRms) * 0.7);
-      env.gain.setTargetAtTime(targetGain, t, envTau);
+
+      if (onsetFrames.has(i)) {
+        // ── Onset: sharp attack + chirp on the pitch + transient noise burst
+        // Pitch chirp: start 15 % below target, rise to target in 25 ms
+        const chirpStart = birdF * 0.85;
+        osc.frequency.cancelScheduledValues(t);
+        osc.frequency.setValueAtTime(chirpStart, t);
+        osc.frequency.linearRampToValueAtTime(birdF, t + 0.025);
+
+        // Sharp envelope attack with a subtle overshoot
+        env.gain.cancelScheduledValues(t);
+        env.gain.setTargetAtTime(targetGain * 1.15, t, 0.004);
+        env.gain.setTargetAtTime(targetGain, t + 0.02, 0.03);
+
+        // Noise transient
+        transientGain.gain.setValueAtTime(0, t);
+        transientGain.gain.linearRampToValueAtTime(0.18, t + 0.003);
+        transientGain.gain.exponentialRampToValueAtTime(0.001, t + 0.03);
+      } else {
+        // Smooth between onsets
+        osc.frequency.linearRampToValueAtTime(birdF, t + hopSec);
+        env.gain.setTargetAtTime(targetGain, t, envTau);
+      }
     } else {
       env.gain.setTargetAtTime(0, t, envTau * 1.4);
     }
@@ -450,11 +516,15 @@ export async function translateToBird(
   lfo.start(0);
   noiseSrc.start(0);
   breathSrc.start(0);
+  transientSrc.start(0);
+  tremolo.start(0);
   const stopAt = duration + 0.2;
   osc.stop(stopAt);
   lfo.stop(stopAt);
   noiseSrc.stop(stopAt);
   breathSrc.stop(stopAt);
+  transientSrc.stop(stopAt);
+  tremolo.stop(stopAt);
 
   if (options.includeMic) {
     const micBuf = offline.createBuffer(1, samples.length, sampleRate);
