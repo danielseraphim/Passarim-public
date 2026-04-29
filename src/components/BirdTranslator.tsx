@@ -222,7 +222,14 @@ export const BirdTranslator = () => {
 
   return (
     <div className="w-full">
-      <div className="relative overflow-hidden rounded-[28px] bg-canopy p-6 text-primary-foreground shadow-card md:p-8">
+      <div
+        className="relative overflow-hidden rounded-[28px] p-6 md:p-14"
+        style={{
+          background: "linear-gradient(135deg, #1F4734 0%, #143425 70%)",
+          color: "var(--cream)",
+          boxShadow: "var(--shadow-card-deep)",
+        }}
+      >
         <Waveform
           level={isRecording ? level : hasResult ? 0.5 : 0}
           active={isRecording || hasResult}
@@ -231,46 +238,57 @@ export const BirdTranslator = () => {
         />
 
         <div className="flex items-center justify-between gap-4">
-          <div className="flex min-w-0 items-center gap-2 text-sm text-primary-foreground/80">
-            <span
-              className={`h-2 w-2 shrink-0 rounded-full ${
-                isRecording
-                  ? "bg-destructive animate-shimmer"
-                  : isTranslating
-                    ? "bg-[hsl(var(--leaf))] animate-shimmer"
-                    : hasResult
-                      ? "bg-[hsl(var(--leaf))]"
-                      : "bg-primary-foreground/40"
-              }`}
-            />
-            <span className="truncate font-medium">{statusText}</span>
+          <div className="flex min-w-0 flex-col gap-1.5">
+            <div className="flex items-center gap-2 text-[13px] font-medium" style={{ color: "var(--lime)" }}>
+              <span
+                className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                  isRecording
+                    ? "bg-red-400 animate-shimmer"
+                    : isTranslating
+                      ? "animate-shimmer"
+                      : hasResult
+                        ? ""
+                        : "opacity-40"
+                }`}
+                style={{ backgroundColor: isRecording ? undefined : "var(--lime)", boxShadow: !isRecording && (isTranslating || hasResult) ? "0 0 8px var(--lime)" : undefined }}
+              />
+              <span className="truncate">{statusText}</span>
+            </div>
+            <div className="font-serif text-[20px] italic" style={{ color: "var(--cream)" }}>
+              {hintText}
+            </div>
           </div>
 
           {isTranslating ? (
-            <div className="flex h-20 w-20 items-center justify-center rounded-full bg-[hsl(var(--cream))] text-canopy shadow-glow">
-              <Loader2 className="h-7 w-7 animate-spin" />
+            <div
+              className="flex h-24 w-24 items-center justify-center rounded-full"
+              style={{ backgroundColor: "var(--lime)", color: "var(--green-deep)", boxShadow: "0 12px 30px -8px rgba(184, 218, 99, 0.5)" }}
+            >
+              <Loader2 className="h-8 w-8 animate-spin" />
             </div>
           ) : hasResult ? (
             <button
               onClick={playBird}
               aria-label="Ouvir tradução"
-              className="relative flex h-20 w-20 items-center justify-center rounded-full bg-[hsl(var(--leaf))] text-canopy shadow-glow transition-transform hover:scale-105 active:scale-95"
+              className="relative flex h-24 w-24 items-center justify-center rounded-full transition-transform hover:scale-105 active:scale-95"
+              style={{ backgroundColor: "var(--lime)", color: "var(--green-deep)", boxShadow: "0 12px 30px -8px rgba(184, 218, 99, 0.5)" }}
             >
-              <Play className="h-7 w-7 fill-current" />
+              <Play className="h-8 w-8 fill-current" />
             </button>
           ) : (
             <button
               onClick={isRecording ? stopAndTranslate : startRecording}
               aria-label={isRecording ? "Parar gravação" : "Começar a gravar"}
-              className="relative flex h-20 w-20 items-center justify-center rounded-full bg-[hsl(var(--cream))] text-canopy shadow-glow transition-transform hover:scale-105 active:scale-95"
+              className="relative flex h-24 w-24 items-center justify-center rounded-full transition-transform hover:scale-105 active:scale-95"
+              style={{ backgroundColor: isRecording ? "rgba(245,241,229,0.95)" : "var(--cream)", color: "var(--green-deep)", boxShadow: "0 12px 30px -8px rgba(184, 218, 99, 0.5)" }}
             >
               {isRecording && (
-                <span className="absolute inset-0 rounded-full bg-destructive/40 animate-pulse-ring" />
+                <span className="absolute inset-0 rounded-full bg-red-500/30 animate-pulse-ring" />
               )}
               {isRecording ? (
-                <Square className="h-6 w-6 fill-current" />
+                <Square className="h-7 w-7 fill-current" />
               ) : (
-                <Mic className="h-7 w-7" strokeWidth={2.2} />
+                <Mic className="h-8 w-8" strokeWidth={2.0} />
               )}
             </button>
           )}
@@ -279,16 +297,24 @@ export const BirdTranslator = () => {
             <DropdownMenuTrigger asChild>
               <button
                 disabled={isRecording || isTranslating}
-                className="flex items-center gap-2 rounded-full border border-primary-foreground/20 bg-primary-foreground/5 py-1.5 pl-1.5 pr-3 text-sm hover:bg-primary-foreground/10 disabled:opacity-50"
+                className="flex items-center gap-3 rounded-full py-2 pl-2 pr-4 text-[15px] transition-colors disabled:opacity-50"
+                style={{
+                  border: "1px solid rgba(184, 218, 99, 0.4)",
+                  backgroundColor: "rgba(15, 42, 31, 0.4)",
+                  color: "var(--cream)",
+                }}
               >
-                <span className="flex h-7 w-7 items-center justify-center rounded-full bg-[hsl(var(--cream))] text-canopy">
-                  <BirdIcon birdKey={birdKey} className="h-5 w-5" />
+                <span
+                  className="flex h-9 w-9 items-center justify-center overflow-hidden rounded-full"
+                  style={{ backgroundColor: "var(--halo)" }}
+                >
+                  <BirdIcon birdKey={birdKey} className="h-9 w-9" />
                 </span>
-                <span className="font-medium">{bird.name}</span>
+                <span>{bird.name.toLowerCase()}</span>
                 <ChevronDown className="h-3.5 w-3.5 opacity-70" />
               </button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-64">
+            <DropdownMenuContent align="end" className="w-64 p-2" style={{ backgroundColor: "var(--cream)", color: "var(--green)" }}>
               {(Object.keys(BIRDS) as BirdKey[]).map((k) => {
                 const b = BIRDS[k];
                 return (
@@ -298,12 +324,15 @@ export const BirdTranslator = () => {
                       setBirdKey(k);
                       if (hasResult) retranslate({ bird: b });
                     }}
-                    className="gap-3"
+                    className="gap-3 rounded-xl py-2"
                   >
-                    <span className="flex h-8 w-8 items-center justify-center rounded-full bg-[hsl(var(--cream))] text-canopy">
-                      <BirdIcon birdKey={k} className="h-6 w-6" />
+                    <span
+                      className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-full"
+                      style={{ backgroundColor: "var(--halo)" }}
+                    >
+                      <BirdIcon birdKey={k} className="h-9 w-9" />
                     </span>
-                    <span className="flex-1">{b.name}</span>
+                    <span className="flex-1 text-[14px]">{b.name.toLowerCase()}</span>
                   </DropdownMenuItem>
                 );
               })}
@@ -311,12 +340,26 @@ export const BirdTranslator = () => {
           </DropdownMenu>
         </div>
 
-        <div className="mt-6 flex flex-col items-center gap-3 border-t border-primary-foreground/10 pt-5">
-          <span className="text-center text-[11px] uppercase tracking-[0.25em] text-primary-foreground/60">
-            {hintText}
-          </span>
+        {/* Divider "ouça como ficou" — só visível com result */}
+        {hasResult && (
+          <div className="relative my-7 h-px" style={{ backgroundColor: "rgba(184, 218, 99, 0.15)" }}>
+            <span
+              className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 whitespace-nowrap px-4 text-[11px] uppercase tracking-[0.32em]"
+              style={{ background: "linear-gradient(135deg, #1F4734 0%, #143425 70%)", color: "rgba(184, 218, 99, 0.6)" }}
+            >
+              ouça como ficou
+            </span>
+          </div>
+        )}
 
-          <div className="flex items-center gap-3 rounded-full border border-primary-foreground/15 bg-primary-foreground/5 px-4 py-2">
+        <div className="mt-6 flex justify-center">
+          <div
+            className="flex items-center gap-3 rounded-full px-5 py-2.5"
+            style={{
+              border: "1px solid rgba(184, 218, 99, 0.3)",
+              backgroundColor: "rgba(15, 42, 31, 0.3)",
+            }}
+          >
             <Switch
               id="include-mic"
               checked={includeMic}
@@ -328,7 +371,8 @@ export const BirdTranslator = () => {
             />
             <Label
               htmlFor="include-mic"
-              className="cursor-pointer text-xs text-primary-foreground/85"
+              className="cursor-pointer text-[13px]"
+              style={{ color: "var(--cream)" }}
             >
               Incluir minha voz junto
             </Label>

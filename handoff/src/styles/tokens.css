@@ -1,0 +1,62 @@
+/* passarim — design tokens */
+
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;1,400&family=Nunito+Sans:wght@300;400;500;600;700&family=Caveat:wght@400;500&display=swap');
+
+:root {
+  /* surface */
+  --cream: #FAF6EC;
+  --cream-2: #F2EBD8;
+  --halo: #F5F1E5;
+
+  /* ink */
+  --green: #1A3D2E;
+  --green-mid: #2C5C42;
+  --green-deep: #0F2A1F;
+  --green-soft: #4F6B5A;
+
+  /* accents */
+  --lime: #B8DA63;
+  --lime-deep: #8FBE3D;
+  --gold: #D4A84B;
+  --rule: #C9C2AB;
+
+  /* bird accents */
+  --bird-bemtevi: #F2C94C;
+  --bird-sabia: #E67E22;
+  --bird-uirapuru: #E74C3C;
+  --bird-azulao: #2D7DD2;
+  --bird-tiesangue: #6BAF6B;
+  --bird-sanhacu: #A48DBA;
+
+  /* type */
+  --font-display: 'Cormorant Garamond', Georgia, serif;
+  --font-body: 'Nunito Sans', system-ui, sans-serif;
+  --font-script: 'Caveat', cursive;
+
+  /* radius */
+  --r-sm: 4px;
+  --r-md: 18px;
+  --r-lg: 28px;
+  --r-pill: 999px;
+
+  /* shadow */
+  --shadow-card: 0 30px 60px -25px rgba(15, 42, 31, 0.35);
+  --shadow-glow-lime: 0 12px 30px -8px rgba(184, 218, 99, 0.5);
+
+  /* spacing scale (use freely) */
+  --gap-xs: 8px;
+  --gap-sm: 14px;
+  --gap-md: 24px;
+  --gap-lg: 48px;
+  --gap-xl: 72px;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: var(--font-body);
+  background: var(--cream);
+  color: var(--green);
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}

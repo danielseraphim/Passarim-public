@@ -44,6 +44,10 @@ export type BirdProfile = {
   formantQ: number;
   attackHardness: number;
   description: string;
+  sciName: string;
+  biome: string;
+  vocalization: string;
+  trivia: string;
 };
 
 export const BIRDS: Record<string, BirdProfile> = {
@@ -52,36 +56,60 @@ export const BIRDS: Record<string, BirdProfile> = {
     baseFreq: 2400, pitchRange: 700, trill: 4.0, warble: 0.5,
     formantFreq: 2800, formantQ: 3.5, attackHardness: 0.7,
     description: "O guardião da manhã, assobio claro que abre o dia na natureza.",
+    sciName: "Pitangus sulphuratus",
+    biome: "Mata Atlântica, Cerrado, Caatinga, Amazônia",
+    vocalization: "Trissílabo explosivo e onomatopeico — \"bem-te-vi\".",
+    trivia: "O nome popular é literalmente o som do canto. Um dos pássaros mais reconhecidos do Brasil.",
   },
   sabia: {
     name: "Sabiá-laranjeira", accent: "#E67E22",
     baseFreq: 2100, pitchRange: 600, trill: 3.5, warble: 0.6,
     formantFreq: 2400, formantQ: 3.0, attackHardness: 0.3,
     description: "Poeta da paisagem, seu assobio é memória e tradição.",
+    sciName: "Turdus rufiventris",
+    biome: "Mata Atlântica, Cerrado, Pantanal",
+    vocalization: "Flauteado, melodioso, com frases longas e variadas.",
+    trivia: "Ave-símbolo do Brasil desde 2002. Inspirou Gonçalves Dias, Tom Jobim e gerações de poetas.",
   },
   uirapuru: {
     name: "Uirapuru", accent: "#E74C3C",
     baseFreq: 2500, pitchRange: 900, trill: 7.0, warble: 1.0,
     formantFreq: 2700, formantQ: 2.5, attackHardness: 0.5,
     description: "Raro e misterioso, seu assobio ecoa como encantamento da mata.",
+    sciName: "Cyphorhinus arada",
+    biome: "Floresta Amazônica",
+    vocalization: "Sequência complexa de notas claras em harmonia, das mais melodiosas do mundo.",
+    trivia: "Lendas indígenas dizem que outras aves silenciam para ouvi-lo. Considerado o pássaro encantado da Amazônia.",
   },
   azulao: {
     name: "Azulão", accent: "#2D7DD2",
     baseFreq: 2200, pitchRange: 400, trill: 2.5, warble: 0.3,
     formantFreq: 2200, formantQ: 4.5, attackHardness: 0.4,
     description: "Força e beleza, seu assobio é firme e marcante.",
+    sciName: "Cyanoloxia brissonii",
+    biome: "Cerrado, Caatinga, Mata Atlântica",
+    vocalization: "Notas claras e firmes em sequência, melodicamente puras.",
+    trivia: "Macho azul-cobalto intenso, fêmea marrom — dimorfismo extremo. Foi muito perseguido como ave de gaiola.",
   },
   tiesangue: {
-    name: "Tiê-sangue", accent: "#6BAF6B",
+    name: "Tiê-sangue", accent: "#C8102E",
     baseFreq: 2800, pitchRange: 500, trill: 5.0, warble: 0.5,
     formantFreq: 3200, formantQ: 4.0, attackHardness: 0.7,
     description: "Pequeno notável, seu assobio é alegria que contagia.",
+    sciName: "Ramphocelus bresilius",
+    biome: "Mata Atlântica litorânea (Ceará a Rio Grande do Sul)",
+    vocalization: "Chamados curtos e percussivos, vivos e repetidos.",
+    trivia: "Endêmico do Brasil — só existe aqui. Macho com plumagem vermelho-sangue intensa.",
   },
   sanhacu: {
-    name: "Sanhaçu", accent: "#A48DBA",
+    name: "Sanhaçu", accent: "#7BA0AE",
     baseFreq: 3000, pitchRange: 500, trill: 4.0, warble: 0.6,
     formantFreq: 3500, formantQ: 3.0, attackHardness: 0.6,
     description: "Cores que cantam, sua presença é pura vibração.",
+    sciName: "Tangara sayaca",
+    biome: "Mata Atlântica, Cerrado, áreas urbanas",
+    vocalization: "Gorjeio curto e variado, com chamados leves repetidos.",
+    trivia: "Bem adaptado a quintais e pomares — um dos pássaros urbanos mais comuns do sudeste.",
   },
 };
 

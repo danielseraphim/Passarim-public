@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;1,400&family=Nunito+Sans:wght@300;400;500;600;700&family=Caveat:wght@400;500&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -67,6 +67,20 @@ All colors MUST be HSL.
     --sidebar-accent-foreground: 240 5.9% 10%;
     --sidebar-border: 220 13% 91%;
     --sidebar-ring: 217.2 91.2% 59.8%;
+
+    /* ── Handoff design tokens (additive — coexist with the hsl tokens above) */
+    --cream: #FAF6EC;
+    --cream-2: #F2EBD8;
+    --halo: #F5F1E5;
+    --green: #1A3D2E;
+    --green-mid: #2C5C42;
+    --green-deep: #0F2A1F;
+    --green-soft: #4F6B5A;
+    --lime: #B8DA63;
+    --lime-deep: #8FBE3D;
+    --gold: #D4A84B;
+    --rule: #C9C2AB;
+    --shadow-card-deep: 0 30px 60px -25px rgba(15, 42, 31, 0.35);
   }
 
   .dark {
@@ -115,13 +129,16 @@ All colors MUST be HSL.
 
   body {
     @apply bg-background text-foreground antialiased;
-    font-family: 'Inter', system-ui, sans-serif;
-    font-feature-settings: "ss01", "cv01";
+    font-family: 'Nunito Sans', system-ui, sans-serif;
   }
   .font-serif, h1, h2, h3 {
-    font-family: 'Fraunces', Georgia, serif;
+    font-family: 'Cormorant Garamond', Georgia, serif;
     font-optical-sizing: auto;
-    letter-spacing: -0.01em;
+    letter-spacing: -0.015em;
+    font-weight: 500;
+  }
+  .font-script {
+    font-family: 'Caveat', cursive;
   }
 }
 
