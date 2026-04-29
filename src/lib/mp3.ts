@@ -25,7 +25,7 @@ export function encodeMP3(
 
   const encoder = new Mp3Encoder(1, sampleRate, bitrateKbps);
   const blockSize = 1152; // MPEG frame size for sample buffer
-  const chunks: Int8Array[] = [];
+  const chunks: BlobPart[] = [];
 
   for (let i = 0; i < int16.length; i += blockSize) {
     const chunk = int16.subarray(i, Math.min(i + blockSize, int16.length));
