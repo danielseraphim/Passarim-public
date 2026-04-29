@@ -1,17 +1,16 @@
 // Brazilian-bird-inspired whistle synthesizer — single-buffer per syllable.
 //
 // Goal: preserve the user's melody intelligibly with the timbre of their own
-// whistle, lightly humanised. We dropped granular synthesis: one
-// AudioBufferSourceNode per syllable, with playbackRate setting the anchor
-// pitch and detune.linearRampToValueAtTime applying the per-syllable
-// contour in cents. Cleaner, no AM-buzz from grain crossfading, syllables
-// are genuinely discrete.
+// whistle, lightly humanised. One AudioBufferSourceNode per syllable, with
+// playbackRate setting the anchor pitch and detune.linearRampToValueAtTime
+// applying the per-syllable contour in cents.
 //
 // Pipeline:
 //   YIN → median → octave-error correction → EMA → onset detection
-//   (energy AND pitch jumps) → for each onset: magnetism-quantise pitch,
-//   pick contour shape, schedule ONE buffer source with detune contour
-//   → reverb / formant / limiter
+//   (energy AND pitch jumps) → for each onset: sample pitch from the
+//   middle of the syllable (transient at note start can be off-pitch),
+//   magnetism-quantise, pick contour shape, schedule ONE buffer source
+//   with detune contour → reverb / formant / limiter.
 
 const SOURCE_URL = "/whistle-source.ogg";
 const SOURCE_PITCH = 1500;
@@ -462,6 +461,44 @@ type Syllable = {
   anchorPitch: number;
 };
 
+/**
+ * Sample the user's pitch in the steady-state portion of a syllable
+ * (30 %-70 % of its duration), taking the median of voiced frames.
+ * The first frames after an onset are typically a transient — the pitch
+ * hasn't settled yet, so sampling there can land on a wrong note (e.g.
+ * a "Si" with a 50 ms rise into pitch reads as a different note at frame 0).
+ */
+function sampleSyllablePitch(
+  f0Smooth: number[],
+  onsetIdx: number,
+  durationSec: number,
+  hopSec: number,
+  fallback: number,
+): number {
+  const startFrame = onsetIdx + Math.floor((durationSec * 0.3) / hopSec);
+  const endFrame = onsetIdx + Math.floor((durationSec * 0.7) / hopSec);
+  const samples: number[] = [];
+  for (
+    let s = Math.max(0, startFrame);
+    s <= endFrame && s < f0Smooth.length;
+    s++
+  ) {
+    if (f0Smooth[s] > 0) samples.push(f0Smooth[s]);
+  }
+  if (samples.length > 0) {
+    samples.sort((a, b) => a - b);
+    return samples[samples.length >> 1];
+  }
+  // Fallback: nearest voiced frame within ±100 ms of the onset.
+  for (let d = 0; d < 10; d++) {
+    if (onsetIdx + d < f0Smooth.length && f0Smooth[onsetIdx + d] > 0)
+      return f0Smooth[onsetIdx + d];
+    if (onsetIdx - d >= 0 && f0Smooth[onsetIdx - d] > 0)
+      return f0Smooth[onsetIdx - d];
+  }
+  return fallback;
+}
+
 export async function translateToBird(
   samples: Float32Array,
   sampleRate: number,
@@ -532,20 +569,15 @@ export async function translateToBird(
   for (let i = 0; i < onsets.length; i++) {
     const idx = onsets[i];
 
-    let userPitch = 0;
-    for (let d = 0; d < 10 && userPitch === 0; d++) {
-      if (idx + d < f0Smooth.length && f0Smooth[idx + d] > 0)
-        userPitch = f0Smooth[idx + d];
-      else if (idx - d >= 0 && f0Smooth[idx - d] > 0)
-        userPitch = f0Smooth[idx - d];
-    }
-    if (userPitch === 0) userPitch = avgF0;
-
+    // Compute timing first so we can sample pitch from the middle.
     const start = idx * hopSec;
     const nextStart =
       i + 1 < onsets.length ? onsets[i + 1] * hopSec : duration;
     const gap = nextStart - start;
     let dur = Math.min(MAX_DUR, Math.max(MIN_DUR, gap - MIN_SILENCE));
+
+    // Sample pitch from the steady-state portion of the syllable.
+    const userPitch = sampleSyllablePitch(f0Smooth, idx, dur, hopSec, avgF0);
 
     const prevGap = i === 0 ? Infinity : start - onsets[i - 1] * hopSec;
     const isAccented = i === 0 || prevGap > meanIOI * 1.3;
@@ -578,7 +610,6 @@ export async function translateToBird(
     syllables.push({ start, duration: dur, amplitude, contour, isAccented, anchorPitch });
   }
 
-  // Drier reverb (0.5 s tail, 0.15 wet) — phrases stay distinct.
   const reverbTail = 0.7;
   const totalLen = Math.floor((duration + reverbTail) * sampleRate);
   const offline = new OfflineAudioContext(1, totalLen, sampleRate);
@@ -622,17 +653,14 @@ export async function translateToBird(
   lowpass.frequency.value = 7000;
   highpass.connect(formant).connect(lowpass).connect(limiter);
 
-  const noiseBuf = offline.createBuffer(1, Math.floor(0.08 * sampleRate), sampleRate);
-  const noiseData = noiseBuf.getChannelData(0);
-  for (let i = 0; i < noiseData.length; i++) noiseData[i] = Math.random() * 2 - 1;
-
   const sourceUsableLen = Math.max(0.05, sourceBuffer.duration - 0.2);
   let sourceCursor = 0;
   const SOURCE_CURSOR_STEP = 0.13;
 
-  // ── ONE BufferSource per syllable. Pitch comes from playbackRate (anchor)
-  // plus detune automation (contour, in cents relative to anchor). No
-  // grain crossfading ⇒ no AM buzz.
+  // ── ONE BufferSource per syllable. No more onset noise transient — the
+  // 5500 Hz noise burst at every onset was creating a "pir-pir-pir"
+  // chittering on rapid passages. The exponential 5 ms attack on the
+  // syllable envelope is enough articulation on its own.
   for (let i = 0; i < syllables.length; i++) {
     const syl = syllables[i];
     const sylEnv = offline.createGain();
@@ -654,11 +682,9 @@ export async function translateToBird(
 
     const src = offline.createBufferSource();
     src.buffer = sourceBuffer;
-    // Base pitch ratio (anchor / source)
     const baseRate = Math.min(4.0, Math.max(0.4, syl.anchorPitch / SOURCE_PITCH));
     src.playbackRate.value = baseRate;
 
-    // Apply contour as detune in cents relative to anchor.
     if (syl.contour.length > 0) {
       const initialCents = 1200 * Math.log2(
         Math.max(1, syl.contour[0].f) / syl.anchorPitch,
@@ -675,31 +701,12 @@ export async function translateToBird(
       }
     }
 
-    // Different start offset per syllable so the timbre VARIES across
-    // syllables instead of every note sounding identical.
     const sourceStart = sourceCursor;
     sourceCursor = (sourceCursor + SOURCE_CURSOR_STEP) % sourceUsableLen;
 
     src.connect(sylEnv);
     src.start(syl.start, sourceStart);
     src.stop(syl.start + syl.duration + 0.05);
-
-    // Onset transient noise — same as before
-    const noiseSrc = offline.createBufferSource();
-    noiseSrc.buffer = noiseBuf;
-    const noiseBp = offline.createBiquadFilter();
-    noiseBp.type = "bandpass";
-    noiseBp.frequency.value = 5500;
-    noiseBp.Q.value = 1.6;
-    const noiseGain = offline.createGain();
-    const transientPeak =
-      0.18 * bird.attackHardness * syl.amplitude * (syl.isAccented ? 1.4 : 1);
-    noiseGain.gain.setValueAtTime(0, syl.start);
-    noiseGain.gain.linearRampToValueAtTime(transientPeak, syl.start + 0.003);
-    noiseGain.gain.exponentialRampToValueAtTime(0.001, syl.start + 0.025);
-    noiseSrc.connect(noiseBp).connect(noiseGain).connect(limiter);
-    noiseSrc.start(syl.start);
-    noiseSrc.stop(syl.start + 0.06);
   }
 
   if (options.includeMic) {
