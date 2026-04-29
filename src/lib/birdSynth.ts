@@ -576,8 +576,19 @@ export async function translateToBird(
     const gap = nextStart - start;
     let dur = Math.min(MAX_DUR, Math.max(MIN_DUR, gap - MIN_SILENCE));
 
-    // Sample pitch from the steady-state portion of the syllable.
-    const userPitch = sampleSyllablePitch(f0Smooth, idx, dur, hopSec, avgF0);
+    // Sample pitch at/near the onset frame. Whistle (unlike sung voice)
+    // doesn't have a transient — the note starts at its target pitch
+    // immediately. Sampling from the syllable middle introduced breath-drift
+    // noise that misidentified notes; this is the simpler "first voiced
+    // frame within ±100 ms" approach restored.
+    let userPitch = 0;
+    for (let d = 0; d < 10 && userPitch === 0; d++) {
+      if (idx + d < f0Smooth.length && f0Smooth[idx + d] > 0)
+        userPitch = f0Smooth[idx + d];
+      else if (idx - d >= 0 && f0Smooth[idx - d] > 0)
+        userPitch = f0Smooth[idx - d];
+    }
+    if (userPitch === 0) userPitch = avgF0;
 
     const prevGap = i === 0 ? Infinity : start - onsets[i - 1] * hopSec;
     const isAccented = i === 0 || prevGap > meanIOI * 1.3;
