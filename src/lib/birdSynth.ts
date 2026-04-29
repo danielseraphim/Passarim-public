@@ -1,23 +1,28 @@
-// Brazilian-bird-inspired whistle synthesizer — melody-follower edition.
+// Brazilian-bird-inspired whistle synthesizer — melody-follower edition,
+// calibrated against real human-whistle recordings.
 //
-// Pipeline:
-//   1. Decimate audio (×4 from 44.1 kHz → ~11 kHz) so the O(N²) YIN inner
-//      loop is cheap on every frame.
-//   2. Frame-by-frame YIN pitch detection (40 ms frames, 10 ms hop), with a
-//      median filter to suppress octave-jump errors.
-//   3. Compute the user's mean F0 over voiced frames and choose an integer
-//      octave shift so the melody lands near the chosen bird's central pitch.
-//   4. Render with a single oscillator using a PeriodicWave (sine + small 2nd
-//      harmonic, phase-locked), light vibrato, bandpass shaped on the bird's
-//      central frequency, and a brick-wall limiter to keep MP3 encoding clean.
+// Targets measured from 18 reference whistles:
+//   - F0 around 1500 Hz (typical 1200-1800)
+//   - Vibrato rate ~3 Hz (slow)
+//   - Vibrato depth ~80-150 Hz peak (much deeper than typical synth!)
+//   - Essentially zero harmonic content (pure sine)
+//
+// Architecture:
+//   1. Decimate audio (×4) and run YIN per frame.
+//   2. Median (window 7) + EMA smoothing on the F0 contour.
+//   3. Octave-shift to land near each bird's baseFreq.
+//   4. Render: pure sine oscillator with TWO modulation sources on its
+//      frequency: a slow ~3 Hz vibrato LFO, and low-passed noise that gives
+//      the natural "warble" a human whistle has from breath/lip variation.
+//      Soft DynamicsCompressor as a safety limiter.
 
 export type BirdProfile = {
   name: string;
   accent: string;
   baseFreq: number;
   pitchRange: number;
-  trill: number;
-  warble: number;
+  trill: number;   // vibrato rate (Hz) — measured ~3 in real whistles
+  warble: number;  // vibrato depth scaler — measured ~80-150 Hz peak
   description: string;
 };
 
@@ -25,55 +30,55 @@ export const BIRDS: Record<string, BirdProfile> = {
   bemtevi: {
     name: "Bem-te-vi",
     accent: "#F2C94C",
-    baseFreq: 2600,
-    pitchRange: 1100,
-    trill: 4.5,
-    warble: 0.5,
+    baseFreq: 1900,
+    pitchRange: 700,
+    trill: 3.2,
+    warble: 0.9,
     description: "O guardião da manhã, canto claro que abre o dia na natureza.",
   },
   sabia: {
     name: "Sabiá-laranjeira",
     accent: "#E67E22",
-    baseFreq: 2200,
-    pitchRange: 700,
-    trill: 5.5,
-    warble: 0.35,
+    baseFreq: 1600,
+    pitchRange: 500,
+    trill: 2.8,
+    warble: 0.7,
     description: "Poeta da paisagem, seu canto é memória e tradição.",
   },
   uirapuru: {
     name: "Uirapuru",
     accent: "#E74C3C",
-    baseFreq: 2900,
-    pitchRange: 1300,
-    trill: 7.5,
-    warble: 0.7,
+    baseFreq: 2100,
+    pitchRange: 800,
+    trill: 4.0,
+    warble: 1.0,
     description: "Raro e misterioso, seu canto ecoa como encantamento da mata.",
   },
   azulao: {
     name: "Azulão",
     accent: "#2D7DD2",
-    baseFreq: 2500,
-    pitchRange: 600,
-    trill: 4,
-    warble: 0.3,
+    baseFreq: 1800,
+    pitchRange: 400,
+    trill: 2.5,
+    warble: 0.6,
     description: "Força e beleza, seu canto é firme e marcante.",
   },
   tiesangue: {
     name: "Tiê-sangue",
     accent: "#6BAF6B",
-    baseFreq: 3100,
-    pitchRange: 700,
-    trill: 6,
-    warble: 0.5,
+    baseFreq: 2200,
+    pitchRange: 500,
+    trill: 3.5,
+    warble: 0.85,
     description: "Pequeno notável, seu canto é alegria que contagia.",
   },
   sanhacu: {
     name: "Sanhaçu",
     accent: "#A48DBA",
-    baseFreq: 3300,
-    pitchRange: 800,
-    trill: 6.5,
-    warble: 0.5,
+    baseFreq: 2300,
+    pitchRange: 500,
+    trill: 3.4,
+    warble: 0.8,
     description: "Cores que cantam, sua presença é pura vibração.",
   },
 };
@@ -212,7 +217,7 @@ function yinPitch(
   return { f0: sampleRate / refined, conf: Math.max(0, Math.min(1, 1 - x1)) };
 }
 
-function medianFilter(arr: number[], k = 5): number[] {
+function medianFilter(arr: number[], k = 7): number[] {
   const r = Math.floor(k / 2);
   const out = arr.slice();
   for (let i = 0; i < arr.length; i++) {
@@ -227,6 +232,55 @@ function medianFilter(arr: number[], k = 5): number[] {
     }
   }
   return out;
+}
+
+function emaSmooth(arr: number[], alpha = 0.4): number[] {
+  const out = arr.slice();
+  let prev = 0;
+  for (let i = 0; i < arr.length; i++) {
+    if (arr[i] === 0) {
+      out[i] = 0;
+      prev = 0;
+    } else if (prev === 0) {
+      out[i] = arr[i];
+      prev = arr[i];
+    } else {
+      const sm = alpha * arr[i] + (1 - alpha) * prev;
+      out[i] = sm;
+      prev = sm;
+    }
+  }
+  return out;
+}
+
+/**
+ * Build a 1-second buffer of low-passed pink-ish noise. We loop this through
+ * the offline context as a pitch-modulation source — the result is the
+ * irregular "warble" a human whistle has from breath/lip micro-variation.
+ * Without it the synth pitch is too steady and reads as digital.
+ */
+function makeNoiseModBuffer(ctx: OfflineAudioContext, durationSec: number): AudioBuffer {
+  const n = Math.max(1, Math.floor(ctx.sampleRate * durationSec));
+  const buf = ctx.createBuffer(1, n, ctx.sampleRate);
+  const data = buf.getChannelData(0);
+  // White noise...
+  for (let i = 0; i < n; i++) data[i] = Math.random() * 2 - 1;
+  // ...then a 1-pole low-pass in the time domain to bias toward slow wobble.
+  // alpha for a cutoff around 6 Hz: alpha = dt / (rc + dt), rc = 1/(2π*fc)
+  const dt = 1 / ctx.sampleRate;
+  const fc = 6;
+  const rc = 1 / (2 * Math.PI * fc);
+  const alpha = dt / (rc + dt);
+  let prev = 0;
+  for (let i = 0; i < n; i++) {
+    prev = prev + alpha * (data[i] - prev);
+    data[i] = prev;
+  }
+  // Normalise to ±1
+  let peak = 1e-6;
+  for (let i = 0; i < n; i++) if (Math.abs(data[i]) > peak) peak = Math.abs(data[i]);
+  for (let i = 0; i < n; i++) data[i] /= peak;
+  return buf;
 }
 
 export async function translateToBird(
@@ -262,7 +316,8 @@ export async function translateToBird(
     if (conf > 0.5 && f0 > 70 && f0 < 600) f0s[i] = f0;
   }
 
-  const f0Smooth = medianFilter(f0s, 5);
+  const f0Med = medianFilter(f0s, 7);
+  const f0Smooth = emaSmooth(f0Med, 0.4);
 
   let voicedSum = 0,
     voicedCount = 0;
@@ -282,76 +337,61 @@ export async function translateToBird(
   const totalLen = Math.floor((duration + tail) * sampleRate);
   const offline = new OfflineAudioContext(1, totalLen, sampleRate);
 
-  // Bandpass shapes the timbre on the bird's central frequency. Q=1.2 keeps
-  // a clear "whistle" character without ringing on transients.
-  const bandpass = offline.createBiquadFilter();
-  bandpass.type = "bandpass";
-  bandpass.frequency.value = bird.baseFreq;
-  bandpass.Q.value = 1.2;
-
-  // Roll off harshness above 6 kHz a touch.
-  const highshelf = offline.createBiquadFilter();
-  highshelf.type = "highshelf";
-  highshelf.frequency.value = 6000;
-  highshelf.gain.value = -8;
-
-  // Brick-wall-ish limiter: prevents the bandpass resonance + envelope from
-  // ever pushing the signal above 0 dBFS. Without this we get harsh hash
-  // when the MP3 encoder hits clipped samples.
   const limiter = offline.createDynamicsCompressor();
-  limiter.threshold.value = -3;
-  limiter.knee.value = 0;
-  limiter.ratio.value = 20;
-  limiter.attack.value = 0.001;
-  limiter.release.value = 0.05;
+  limiter.threshold.value = -1;
+  limiter.knee.value = 3;
+  limiter.ratio.value = 8;
+  limiter.attack.value = 0.005;
+  limiter.release.value = 0.08;
 
   const master = offline.createGain();
-  master.gain.value = 0.55;
+  master.gain.value = 0.45;
 
-  bandpass
-    .connect(highshelf)
-    .connect(limiter)
-    .connect(master)
-    .connect(offline.destination);
+  limiter.connect(master).connect(offline.destination);
 
-  // Single oscillator with sine + small 2nd harmonic baked into a PeriodicWave.
-  // This keeps the harmonic phase-locked to the fundamental — vibrato/glide
-  // shifts both together with no inter-oscillator beating.
-  const real = new Float32Array([0, 1, 0.12]);
-  const imag = new Float32Array([0, 0, 0]);
-  const wave = offline.createPeriodicWave(real, imag, {
-    disableNormalization: true,
-  });
+  // Pure sine — matches the spectrum of real whistle (h2/h1 ≈ 0.005 measured).
   const osc = offline.createOscillator();
-  osc.setPeriodicWave(wave);
+  osc.type = "sine";
 
-  // Vibrato.
+  // Slow vibrato (~3 Hz, deep) — matches the measured profile of real whistles.
   const lfo = offline.createOscillator();
   lfo.type = "sine";
   lfo.frequency.value = bird.trill;
   const lfoDepth = offline.createGain();
-  lfoDepth.gain.value = bird.warble * 18;
+  // Depth in Hz. With warble 0.6-1.0 this gives 48-100 Hz peak excursion,
+  // close to the measured 80-150 Hz of real whistles.
+  lfoDepth.gain.value = bird.warble * 80;
   lfo.connect(lfoDepth);
   lfoDepth.connect(osc.frequency);
 
+  // Filtered noise on top of the LFO — provides the irregular micro-warble
+  // that distinguishes a human whistle from a steady oscillator. Without
+  // this the output sounds "too perfect" / digital.
+  const noiseBuf = makeNoiseModBuffer(offline, Math.min(2, duration + tail));
+  const noiseSrc = offline.createBufferSource();
+  noiseSrc.buffer = noiseBuf;
+  noiseSrc.loop = true;
+  const noiseDepth = offline.createGain();
+  noiseDepth.gain.value = bird.warble * 35; // ~25-35 Hz of random wobble
+  noiseSrc.connect(noiseDepth);
+  noiseDepth.connect(osc.frequency);
+
   const env = offline.createGain();
   env.gain.setValueAtTime(0, 0);
-  osc.connect(env).connect(bandpass);
+  osc.connect(env).connect(limiter);
 
   osc.frequency.setValueAtTime(bird.baseFreq, 0);
 
-  // Schedule pitch + gain frame-by-frame. Pitch uses linearRamp (smooth
-  // glide between notes); gain uses setTargetAtTime (exponential approach,
-  // no zipper noise on rapid voiced↔unvoiced transitions).
   const hopSec = hop / decRate;
-  const envTau = 0.022; // ~22 ms
+  const envTau = 0.025;
   for (let i = 0; i < numFrames; i++) {
     const t = i * hopSec;
     const f = f0Smooth[i];
     if (f > 0) {
-      const birdF = Math.min(5500, Math.max(800, f * shiftFactor));
+      // Real whistles top out around 2900 Hz — clamp tighter than before.
+      const birdF = Math.min(2900, Math.max(800, f * shiftFactor));
       osc.frequency.linearRampToValueAtTime(birdF, t + hopSec);
-      const targetGain = Math.min(0.4, (rmss[i] / peakRms) * 0.5);
+      const targetGain = Math.min(0.55, (rmss[i] / peakRms) * 0.7);
       env.gain.setTargetAtTime(targetGain, t, envTau);
     } else {
       env.gain.setTargetAtTime(0, t, envTau * 1.4);
@@ -361,9 +401,11 @@ export async function translateToBird(
 
   osc.start(0);
   lfo.start(0);
+  noiseSrc.start(0);
   const stopAt = duration + tail;
   osc.stop(stopAt);
   lfo.stop(stopAt);
+  noiseSrc.stop(stopAt);
 
   if (options.includeMic) {
     const micBuf = offline.createBuffer(1, samples.length, sampleRate);

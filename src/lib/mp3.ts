@@ -14,7 +14,7 @@ import { Mp3Encoder } from "@breezystack/lamejs";
 export function encodeMP3(
   samples: Float32Array,
   sampleRate: number,
-  bitrateKbps = 128,
+  bitrateKbps = 192,
 ): Blob {
   // Float32 (-1..1) → Int16 PCM
   const int16 = new Int16Array(samples.length);
