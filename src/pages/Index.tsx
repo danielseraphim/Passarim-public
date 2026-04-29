@@ -8,7 +8,7 @@ const Index = () => {
           passarim
         </h1>
         <p className="mt-4 text-sm text-muted-foreground md:text-base">
-          grave um som e ouça como ele soaria no canto de um pássaro brasileiro.
+          cante ou assobie uma melodia e ouça um pássaro brasileiro repetindo.
         </p>
         <div className="mt-10 text-left">
           <BirdTranslator />

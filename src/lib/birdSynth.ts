@@ -1,30 +1,24 @@
-// Brazilian-bird-inspired whistle synthesizer.
-// Inspired loosely by sabiá-laranjeira, bem-te-vi, sanhaçu, and uirapuru calls.
+// Brazilian-bird-inspired whistle synthesizer — melody-follower edition.
 //
-// Approach (rewrite, april 2026):
-//   1. Detect syllable onsets in the recorded audio using a smoothed RMS
-//      envelope plus a spectral-flux-style novelty score. We do NOT try to
-//      transpose the user's pitch literally — voice/ambient pitch is unreliable
-//      and a literal transpose sounds nothing like a bird. Instead we treat the
-//      input's RHYTHM and LOUDNESS profile as the score, and let the bird
-//      profile determine the timbre and pitch language.
-//   2. For each syllable we schedule a short whistle event with a randomly
-//      chosen pitch contour (rise / fall / U / inverted-U / trill). Real bird
-//      syllables are 30–300ms with sweeping pitch — not a steady tone with
-//      vibrato sprinkled on top.
-//   3. Timbre = sine fundamental + a small (≈12%) second harmonic, both routed
-//      through a tight bandpass centred on the bird's range. The bandpass plus
-//      an exponential decay envelope is what gives the "wet" whistle quality.
-//   4. A tiny breath-noise burst at the attack of each syllable adds the
-//      consonant articulation that pure-sine implementations always miss.
+// Goal: when the user sings or whistles a melody, output that same melody as
+// if a bird were whistling it. Two pieces:
+//
+//   1. YIN-based pitch tracker estimates the F0 contour of the recording.
+//      We decimate the signal to ~11 kHz first so the O(N²) inner loop is
+//      cheap enough to run on every frame.
+//   2. Renderer transposes the contour up an integer number of octaves so
+//      the average voice pitch lands near the bird's characteristic register,
+//      then plays a sine + small 2nd harmonic through a bandpass shaped on
+//      the bird, with light vibrato. Voiced/unvoiced gating gates the gain
+//      so silences stay silent and consonants don't whistle.
 
 export type BirdProfile = {
   name: string;
   emoji: string;
-  baseFreq: number; // center pitch in Hz
-  pitchRange: number; // Hz of total pitch excursion within a syllable
-  trill: number; // characteristic trill / warble rate (Hz)
-  warble: number; // 0..1 — likelihood of trill-shaped syllables
+  baseFreq: number; // bandpass center & target average pitch after octave shift
+  pitchRange: number; // legacy field (unused in melody mode, kept for compat)
+  trill: number; // vibrato rate (Hz)
+  warble: number; // vibrato depth scale (0..1 → ±0..30 Hz)
   description: string;
 };
 
@@ -34,7 +28,7 @@ export const BIRDS: Record<string, BirdProfile> = {
     emoji: "🧡",
     baseFreq: 2200,
     pitchRange: 700,
-    trill: 6,
+    trill: 5.5,
     warble: 0.35,
     description: "Brazil's national bird. Melodic, flute-like phrases.",
   },
@@ -43,7 +37,7 @@ export const BIRDS: Record<string, BirdProfile> = {
     emoji: "💛",
     baseFreq: 2600,
     pitchRange: 1100,
-    trill: 5,
+    trill: 4.5,
     warble: 0.5,
     description: "The classic three-note jungle shout.",
   },
@@ -52,8 +46,8 @@ export const BIRDS: Record<string, BirdProfile> = {
     emoji: "✨",
     baseFreq: 2900,
     pitchRange: 1300,
-    trill: 11,
-    warble: 0.85,
+    trill: 7.5,
+    warble: 0.7,
     description: "Mythical Amazon songbird, intricate trills.",
   },
   sanhacu: {
@@ -61,15 +55,16 @@ export const BIRDS: Record<string, BirdProfile> = {
     emoji: "💙",
     baseFreq: 3300,
     pitchRange: 800,
-    trill: 8,
-    warble: 0.55,
+    trill: 6.5,
+    warble: 0.5,
     description: "Bright, chirpy garden whistler.",
   },
 };
 
-/**
- * MicRecorder: simple two-step recorder. Captures raw mic to a Float32Array.
- */
+// ────────────────────────────────────────────────────────────────────────────
+// MicRecorder — unchanged from previous version.
+// ────────────────────────────────────────────────────────────────────────────
+
 export class MicRecorder {
   private ctx: AudioContext | null = null;
   private stream: MediaStream | null = null;
@@ -96,7 +91,6 @@ export class MicRecorder {
       this.chunks.push(new Float32Array(input));
     };
     this.source.connect(this.processor);
-    // Must connect to destination for ScriptProcessor to fire — use silent gain.
     const silent = this.ctx.createGain();
     silent.gain.value = 0;
     this.processor.connect(silent).connect(this.ctx.destination);
@@ -148,179 +142,103 @@ export class MicRecorder {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Syllable detection — find the rhythmic backbone of the input.
+// Pitch tracking.
 // ────────────────────────────────────────────────────────────────────────────
 
-type Syllable = {
-  start: number; // seconds
-  duration: number; // seconds (0.06..0.35)
-  amplitude: number; // 0..1
-};
+/** Box-filter decimation. Good enough for pitch detection (we only care about
+ *  fundamentals up to ~500Hz, so anti-aliasing above ~5 kHz is sufficient). */
+function decimate(samples: Float32Array, factor: number): Float32Array {
+  if (factor <= 1) return samples;
+  const outLen = Math.floor(samples.length / factor);
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    let sum = 0;
+    const start = i * factor;
+    for (let j = 0; j < factor; j++) sum += samples[start + j];
+    out[i] = sum / factor;
+  }
+  return out;
+}
 
-function detectSyllables(samples: Float32Array, sampleRate: number): Syllable[] {
-  const frameLen = Math.floor(sampleRate * 0.01); // 10ms frames
-  const numFrames = Math.floor(samples.length / frameLen);
-  if (numFrames < 4) return [];
-
-  // Frame energy (RMS) profile.
-  const energy = new Float32Array(numFrames);
-  let peakEnergy = 1e-6;
-  for (let f = 0; f < numFrames; f++) {
-    let sumSq = 0;
-    const off = f * frameLen;
-    for (let i = 0; i < frameLen; i++) {
-      const s = samples[off + i];
-      sumSq += s * s;
+/**
+ * YIN pitch detector (de Cheveigné & Kawahara 2002), simplified.
+ * Returns f0 in Hz and a 0..1 confidence.
+ *
+ * `frame` is expected to be at least `2 * (sampleRate / minFreq)` samples,
+ * i.e. at least two periods of the lowest pitch we care about.
+ */
+function yinPitch(
+  frame: Float32Array,
+  sampleRate: number,
+  threshold = 0.15,
+): { f0: number; conf: number } {
+  const halfN = frame.length >> 1;
+  if (halfN < 8) return { f0: 0, conf: 0 };
+  const diff = new Float32Array(halfN);
+  for (let tau = 0; tau < halfN; tau++) {
+    let s = 0;
+    for (let i = 0; i < halfN; i++) {
+      const d = frame[i] - frame[i + tau];
+      s += d * d;
     }
-    energy[f] = Math.sqrt(sumSq / frameLen);
-    if (energy[f] > peakEnergy) peakEnergy = energy[f];
+    diff[tau] = s;
   }
-
-  // Smooth (3-tap moving average) to suppress spikes.
-  const smooth = new Float32Array(numFrames);
-  for (let f = 0; f < numFrames; f++) {
-    const a = f > 0 ? energy[f - 1] : energy[f];
-    const b = energy[f];
-    const c = f < numFrames - 1 ? energy[f + 1] : energy[f];
-    smooth[f] = (a + b + c) / 3;
+  // Cumulative mean normalized difference function.
+  const cmnd = new Float32Array(halfN);
+  cmnd[0] = 1;
+  let run = 0;
+  for (let tau = 1; tau < halfN; tau++) {
+    run += diff[tau];
+    cmnd[tau] = run > 0 ? (diff[tau] * tau) / run : 1;
   }
+  const minLag = Math.max(2, Math.floor(sampleRate / 500));
+  const maxLag = Math.min(halfN - 2, Math.floor(sampleRate / 70));
+  if (maxLag <= minLag) return { f0: 0, conf: 0 };
 
-  // Onsets: positive derivative crossing above a relative threshold,
-  // with a refractory period so we don't spam syllables.
-  const threshold = peakEnergy * 0.18;
-  const refractoryFrames = 8; // ~80ms minimum syllable gap
-  const onsets: number[] = [];
-  let lastOnset = -refractoryFrames;
-  for (let f = 1; f < numFrames - 1; f++) {
-    const rising = smooth[f] > smooth[f - 1] && smooth[f] >= smooth[f + 1];
-    if (
-      rising &&
-      smooth[f] > threshold &&
-      f - lastOnset >= refractoryFrames
-    ) {
-      onsets.push(f);
-      lastOnset = f;
-    }
-  }
-
-  // If the audio is mostly stationary (rain, traffic, hum), no peaks will
-  // dominate — fall back to a regular pulse driven by the overall envelope.
-  if (onsets.length === 0) {
-    const totalDur = samples.length / sampleRate;
-    const count = Math.max(3, Math.min(14, Math.round(totalDur / 0.3)));
-    for (let i = 0; i < count; i++) {
-      const t = ((i + 0.5) / count) * totalDur;
-      onsets.push(Math.floor((t * sampleRate) / frameLen));
+  let tau = -1;
+  for (let t = minLag; t <= maxLag; t++) {
+    if (cmnd[t] < threshold) {
+      // Walk to the local minimum.
+      while (t + 1 <= maxLag && cmnd[t + 1] < cmnd[t]) t++;
+      tau = t;
+      break;
     }
   }
+  if (tau < 0) return { f0: 0, conf: 0 };
 
-  // Build syllable list with amplitude + duration.
-  const out: Syllable[] = [];
-  for (let k = 0; k < onsets.length; k++) {
-    const f = onsets[k];
-    const next = k + 1 < onsets.length ? onsets[k + 1] : numFrames;
-    const gapFrames = next - f;
-    const duration = Math.min(0.35, Math.max(0.07, gapFrames * 0.01 * 0.85));
-    out.push({
-      start: (f * frameLen) / sampleRate,
-      duration,
-      amplitude: Math.min(1, smooth[f] / peakEnergy + 0.15),
-    });
+  // Parabolic interpolation around the chosen minimum for sub-sample accuracy.
+  const x0 = tau > 0 ? cmnd[tau - 1] : cmnd[tau];
+  const x1 = cmnd[tau];
+  const x2 = tau < halfN - 1 ? cmnd[tau + 1] : cmnd[tau];
+  const denom = 2 * (x0 - 2 * x1 + x2);
+  const refined = denom !== 0 ? tau + (x0 - x2) / denom : tau;
+  return { f0: sampleRate / refined, conf: Math.max(0, Math.min(1, 1 - x1)) };
+}
+
+/** Median filter over a 1D array, ignoring 0 (= unvoiced) values. */
+function medianFilter(arr: number[], k = 5): number[] {
+  const r = Math.floor(k / 2);
+  const out = arr.slice();
+  for (let i = 0; i < arr.length; i++) {
+    const lo = Math.max(0, i - r);
+    const hi = Math.min(arr.length - 1, i + r);
+    const win: number[] = [];
+    for (let j = lo; j <= hi; j++) if (arr[j] > 0) win.push(arr[j]);
+    if (win.length === 0) out[i] = 0;
+    else {
+      win.sort((a, b) => a - b);
+      out[i] = win[win.length >> 1];
+    }
   }
   return out;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Pitch contours — five shapes, picked per syllable.
+// Render.
 // ────────────────────────────────────────────────────────────────────────────
-
-type ContourShape = "rise" | "fall" | "arch" | "dip" | "trill";
-
-function pickShape(bird: BirdProfile, rng: () => number): ContourShape {
-  if (rng() < bird.warble * 0.6) return "trill";
-  const r = rng();
-  if (r < 0.28) return "rise";
-  if (r < 0.55) return "fall";
-  if (r < 0.78) return "arch";
-  return "dip";
-}
 
 /**
- * Build a list of (time, frequency) breakpoints for a syllable, relative to
- * the syllable start. We keep them coarse (≈8 points) — the AudioParam linear
- * ramps interpolate smoothly.
- */
-function buildContour(
-  shape: ContourShape,
-  bird: BirdProfile,
-  duration: number,
-  rng: () => number,
-): { t: number; f: number }[] {
-  const center = bird.baseFreq * (0.92 + rng() * 0.16); // small per-syllable jitter
-  const span = bird.pitchRange * (0.55 + rng() * 0.55);
-  const lo = center - span / 2;
-  const hi = center + span / 2;
-
-  const pts: { t: number; f: number }[] = [];
-  const N = 8;
-  for (let i = 0; i <= N; i++) {
-    const u = i / N; // 0..1
-    let f = center;
-    switch (shape) {
-      case "rise":
-        f = lo + (hi - lo) * u;
-        break;
-      case "fall":
-        f = hi - (hi - lo) * u;
-        break;
-      case "arch": {
-        // sin curve: up then down
-        f = lo + (hi - lo) * Math.sin(u * Math.PI);
-        break;
-      }
-      case "dip": {
-        // inverted arch: start mid, dip, return
-        f = hi - (hi - lo) * Math.sin(u * Math.PI);
-        break;
-      }
-      case "trill": {
-        const wob = Math.sin(u * Math.PI * 2 * bird.trill * duration);
-        f = center + wob * (span / 2);
-        break;
-      }
-    }
-    pts.push({ t: u * duration, f });
-  }
-  return pts;
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Offline render.
-// ────────────────────────────────────────────────────────────────────────────
-
-function makeRng(seed: number): () => number {
-  // Mulberry32 — deterministic per render, so two retranslates of the same
-  // recording with the same bird sound the same.
-  let s = seed >>> 0;
-  return () => {
-    s = (s + 0x6d2b79f5) >>> 0;
-    let t = s;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function makeNoiseBuffer(ctx: OfflineAudioContext, durationSec: number): AudioBuffer {
-  const n = Math.max(1, Math.floor(ctx.sampleRate * durationSec));
-  const buf = ctx.createBuffer(1, n, ctx.sampleRate);
-  const data = buf.getChannelData(0);
-  for (let i = 0; i < n; i++) data[i] = Math.random() * 2 - 1;
-  return buf;
-}
-
-/**
- * Render a bird-whistle interpretation of the recorded buffer.
+ * Transcribe a recorded melody into bird whistle.
  */
 export async function translateToBird(
   samples: Float32Array,
@@ -331,14 +249,60 @@ export async function translateToBird(
   const duration = samples.length / sampleRate;
   if (duration < 0.05) return new Float32Array(0);
 
-  // Add a small tail so the last syllable can decay naturally.
-  const tail = 0.4;
+  // 1) Pitch tracking on a decimated copy of the audio (faster, plenty of
+  //    accuracy for vocal F0).
+  const decimateFactor = sampleRate >= 32000 ? 4 : 2;
+  const dec = decimate(samples, decimateFactor);
+  const decRate = sampleRate / decimateFactor;
+  const frameLen = Math.floor(decRate * 0.04); // 40 ms
+  const hop = Math.floor(decRate * 0.01); // 10 ms
+  const numFrames = Math.max(1, Math.floor((dec.length - frameLen) / hop) + 1);
+
+  const f0s: number[] = new Array(numFrames).fill(0);
+  const rmss: number[] = new Array(numFrames).fill(0);
+  let peakRms = 1e-6;
+
+  for (let i = 0; i < numFrames; i++) {
+    const off = i * hop;
+    const frame = dec.subarray(off, off + frameLen);
+    let sumSq = 0;
+    for (let s = 0; s < frame.length; s++) sumSq += frame[s] * frame[s];
+    const rms = Math.sqrt(sumSq / frame.length);
+    rmss[i] = rms;
+    if (rms > peakRms) peakRms = rms;
+    if (rms < 0.005) continue;
+    const { f0, conf } = yinPitch(frame, decRate);
+    if (conf > 0.5 && f0 > 70 && f0 < 600) f0s[i] = f0;
+  }
+
+  // 2) Median filter to suppress octave-jump errors.
+  const f0Smooth = medianFilter(f0s, 5);
+
+  // 3) Pick octave shift so the average user pitch lands near bird.baseFreq.
+  let voicedSum = 0,
+    voicedCount = 0;
+  for (const f of f0Smooth)
+    if (f > 0) {
+      voicedSum += f;
+      voicedCount++;
+    }
+
+  if (voicedCount < 3) {
+    // No melody detected. Output a short polite chirp at the bird's pitch
+    // instead of silence so the user knows something happened.
+    return makeSilenceChirp(sampleRate, bird);
+  }
+
+  const avgF0 = voicedSum / voicedCount;
+  const octaveShift = Math.round(Math.log2(bird.baseFreq / avgF0));
+  const shiftFactor = Math.pow(2, octaveShift);
+
+  // 4) Offline render.
+  const tail = 0.25;
   const totalLen = Math.floor((duration + tail) * sampleRate);
   const offline = new OfflineAudioContext(1, totalLen, sampleRate);
 
-  // Master chain: bandpass shaped on the bird's range → soft compressor → out.
-  // Bandpass keeps the timbre focused (the "whistle" character); without it the
-  // second harmonic makes everything sound like a square wave.
+  // Bandpass shaped on the bird's central frequency — the timbre signature.
   const bandpass = offline.createBiquadFilter();
   bandpass.type = "bandpass";
   bandpass.frequency.value = bird.baseFreq;
@@ -347,102 +311,73 @@ export async function translateToBird(
   const highshelf = offline.createBiquadFilter();
   highshelf.type = "highshelf";
   highshelf.frequency.value = 6000;
-  highshelf.gain.value = -8;
+  highshelf.gain.value = -10;
 
   const master = offline.createGain();
-  master.gain.value = 0.85;
-
+  master.gain.value = 0.95;
   bandpass.connect(highshelf).connect(master).connect(offline.destination);
 
-  const syllables = detectSyllables(samples, sampleRate);
-  const rng = makeRng(syllables.length * 1009 + Math.floor(bird.baseFreq));
+  const osc = offline.createOscillator();
+  osc.type = "sine";
+  const osc2 = offline.createOscillator();
+  osc2.type = "sine";
+  const osc2Gain = offline.createGain();
+  osc2Gain.gain.value = 0.13;
 
-  // For each syllable, schedule a fresh oscillator pair + gain envelope.
-  // Doing it per-syllable (rather than one long oscillator with tons of ramps)
-  // is what makes them sound like discrete notes rather than a continuous slide.
-  for (const syl of syllables) {
-    const shape = pickShape(bird, rng);
-    const contour = buildContour(shape, bird, syl.duration, rng);
+  // Light vibrato — gives the "bird" character vs a plain whistle.
+  const lfo = offline.createOscillator();
+  lfo.type = "sine";
+  lfo.frequency.value = bird.trill;
+  const lfoDepth = offline.createGain();
+  lfoDepth.gain.value = bird.warble * 25; // Hz
+  lfo.connect(lfoDepth);
+  lfoDepth.connect(osc.frequency);
+  // Apply same vibrato (scaled) to the second harmonic so they stay locked.
+  const lfoDepth2 = offline.createGain();
+  lfoDepth2.gain.value = bird.warble * 50;
+  lfo.connect(lfoDepth2);
+  lfoDepth2.connect(osc2.frequency);
 
-    // --- Fundamental ---
-    const osc = offline.createOscillator();
-    osc.type = "sine";
+  const env = offline.createGain();
+  env.gain.setValueAtTime(0, 0);
 
-    // --- Second harmonic for warmth (small) ---
-    const osc2 = offline.createOscillator();
-    osc2.type = "sine";
-    const osc2Gain = offline.createGain();
-    osc2Gain.gain.value = 0.12 + rng() * 0.05;
+  osc.connect(env);
+  osc2.connect(osc2Gain).connect(env);
+  env.connect(bandpass);
 
-    // Vibrato LFO (small, varies per syllable so it doesn't sound robotic).
-    const lfo = offline.createOscillator();
-    lfo.type = "sine";
-    lfo.frequency.value = 5 + rng() * 4;
-    const lfoDepth = offline.createGain();
-    lfoDepth.gain.value =
-      shape === "trill" ? 0 : 12 + rng() * 18; // Hz; muted for trills
-    lfo.connect(lfoDepth);
-    lfoDepth.connect(osc.frequency);
-    lfoDepth.connect(osc2.frequency);
+  // Initial pitch — set at t=0 so the first ramp has a known starting point.
+  osc.frequency.setValueAtTime(bird.baseFreq, 0);
+  osc2.frequency.setValueAtTime(bird.baseFreq * 2, 0);
 
-    // Schedule pitch contour breakpoints.
-    const t0 = syl.start;
-    const f0 = contour[0].f;
-    osc.frequency.setValueAtTime(f0, t0);
-    osc2.frequency.setValueAtTime(f0 * 2, t0);
-    for (let i = 1; i < contour.length; i++) {
-      osc.frequency.linearRampToValueAtTime(contour[i].f, t0 + contour[i].t);
-      osc2.frequency.linearRampToValueAtTime(
-        contour[i].f * 2,
-        t0 + contour[i].t,
-      );
+  // Schedule pitch + gain frame-by-frame, gating on voiced/unvoiced.
+  const hopSec = hop / decRate;
+  for (let i = 0; i < numFrames; i++) {
+    const t = i * hopSec;
+    const f = f0Smooth[i];
+    if (f > 0) {
+      const birdF = Math.min(5500, Math.max(800, f * shiftFactor));
+      osc.frequency.linearRampToValueAtTime(birdF, t + hopSec);
+      osc2.frequency.linearRampToValueAtTime(birdF * 2, t + hopSec);
+      const targetGain = Math.min(0.45, (rmss[i] / peakRms) * 0.55);
+      env.gain.linearRampToValueAtTime(targetGain, t + hopSec);
+    } else {
+      // Unvoiced — fade gain down over the frame so silences are silent.
+      env.gain.linearRampToValueAtTime(0, t + hopSec);
     }
-
-    // Amplitude envelope: very fast attack, exponential decay.
-    // Peak amplitude scales with syllable amplitude AND duration (short
-    // syllables peak louder so they read as articulated chirps).
-    const env = offline.createGain();
-    const peak =
-      Math.min(0.42, 0.18 + syl.amplitude * 0.32) *
-      (0.7 + 0.4 * Math.min(1, 0.18 / syl.duration));
-    const attack = 0.008;
-    const release = 0.04;
-
-    env.gain.setValueAtTime(0.0001, t0);
-    env.gain.exponentialRampToValueAtTime(peak, t0 + attack);
-    env.gain.setValueAtTime(peak, t0 + Math.max(attack, syl.duration - release));
-    env.gain.exponentialRampToValueAtTime(0.0001, t0 + syl.duration + 0.05);
-
-    osc.connect(env);
-    osc2.connect(osc2Gain).connect(env);
-    env.connect(bandpass);
-
-    osc.start(t0);
-    osc2.start(t0);
-    lfo.start(t0);
-    const stopAt = t0 + syl.duration + 0.08;
-    osc.stop(stopAt);
-    osc2.stop(stopAt);
-    lfo.stop(stopAt);
-
-    // --- Breath/articulation noise burst at the attack ---
-    const noiseBuf = makeNoiseBuffer(offline, 0.04);
-    const noiseSrc = offline.createBufferSource();
-    noiseSrc.buffer = noiseBuf;
-    const noiseBp = offline.createBiquadFilter();
-    noiseBp.type = "bandpass";
-    noiseBp.frequency.value = bird.baseFreq * 1.1;
-    noiseBp.Q.value = 8;
-    const noiseGain = offline.createGain();
-    noiseGain.gain.setValueAtTime(0.0001, t0);
-    noiseGain.gain.exponentialRampToValueAtTime(0.06 * syl.amplitude, t0 + 0.004);
-    noiseGain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.025);
-    noiseSrc.connect(noiseBp).connect(noiseGain).connect(bandpass);
-    noiseSrc.start(t0);
-    noiseSrc.stop(t0 + 0.04);
   }
 
-  // Optional: mix the original mic in (kept for the "incluir minha voz" toggle).
+  // Final fade.
+  env.gain.linearRampToValueAtTime(0, duration + 0.05);
+
+  osc.start(0);
+  osc2.start(0);
+  lfo.start(0);
+  const stopAt = duration + tail;
+  osc.stop(stopAt);
+  osc2.stop(stopAt);
+  lfo.stop(stopAt);
+
+  // Optional: mix the original mic in so user hears the duet.
   if (options.includeMic) {
     const micBuf = offline.createBuffer(1, samples.length, sampleRate);
     micBuf.getChannelData(0).set(samples);
@@ -458,7 +393,23 @@ export async function translateToBird(
   return rendered.getChannelData(0).slice();
 }
 
-/** Play a Float32Array sample buffer through an AudioContext, return a stop fn. */
+/** Polite default chirp when no melody is detectable in the recording. */
+function makeSilenceChirp(sampleRate: number, bird: BirdProfile): Float32Array {
+  const dur = 0.35;
+  const out = new Float32Array(Math.floor(sampleRate * dur));
+  const f1 = bird.baseFreq;
+  const f2 = bird.baseFreq * 1.25;
+  for (let i = 0; i < out.length; i++) {
+    const t = i / sampleRate;
+    const u = t / dur;
+    const freq = f1 + (f2 - f1) * u;
+    const env = Math.exp(-Math.pow((u - 0.15) * 4, 2));
+    out[i] = Math.sin(2 * Math.PI * freq * t) * 0.35 * env;
+  }
+  return out;
+}
+
+/** Play a Float32Array sample buffer through an AudioContext. */
 export function playSamples(
   samples: Float32Array,
   sampleRate: number,
