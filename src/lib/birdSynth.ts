@@ -1,28 +1,30 @@
 // Brazilian-bird-inspired whistle synthesizer — melody-follower edition,
-// calibrated against real human-whistle recordings.
+// calibrated against real human-whistle recordings, with breath noise +
+// synthetic reverb to add the organic / spatial feel that pure-synth
+// whistles lack.
 //
 // Targets measured from 18 reference whistles:
 //   - F0 around 1500 Hz (typical 1200-1800)
-//   - Vibrato rate ~3 Hz (slow)
-//   - Vibrato depth ~80-150 Hz peak (much deeper than typical synth!)
+//   - Vibrato rate ~3 Hz, depth ~80-150 Hz peak
 //   - Essentially zero harmonic content (pure sine)
 //
-// Architecture:
-//   1. Decimate audio (×4) and run YIN per frame.
-//   2. Median (window 7) + EMA smoothing on the F0 contour.
-//   3. Octave-shift to land near each bird's baseFreq.
-//   4. Render: pure sine oscillator with TWO modulation sources on its
-//      frequency: a slow ~3 Hz vibrato LFO, and low-passed noise that gives
-//      the natural "warble" a human whistle has from breath/lip variation.
-//      Soft DynamicsCompressor as a safety limiter.
+// Signal chain:
+//   oscillator (sine, slow vibrato + noise pitch jitter)
+//      ↓ summed with breath noise (bandpass-filtered, gated by envelope)
+//   envelope (per-frame, follows voiced/unvoiced)
+//      ↓
+//   limiter (safety)
+//      ↓ ┐ dry path (direct)
+//        └ wet path → ConvolverNode (synthetic IR, ~1.2 s decay)
+//      ↓ both summed at master gain → output
 
 export type BirdProfile = {
   name: string;
   accent: string;
   baseFreq: number;
   pitchRange: number;
-  trill: number;   // vibrato rate (Hz) — measured ~3 in real whistles
-  warble: number;  // vibrato depth scaler — measured ~80-150 Hz peak
+  trill: number;
+  warble: number;
   description: string;
 };
 
@@ -254,19 +256,15 @@ function emaSmooth(arr: number[], alpha = 0.4): number[] {
 }
 
 /**
- * Build a 1-second buffer of low-passed pink-ish noise. We loop this through
- * the offline context as a pitch-modulation source — the result is the
- * irregular "warble" a human whistle has from breath/lip micro-variation.
- * Without it the synth pitch is too steady and reads as digital.
+ * Low-passed white noise buffer used to modulate the oscillator's pitch.
+ * Gives the irregular wobble that human breath/lip variation produces.
  */
 function makeNoiseModBuffer(ctx: OfflineAudioContext, durationSec: number): AudioBuffer {
   const n = Math.max(1, Math.floor(ctx.sampleRate * durationSec));
   const buf = ctx.createBuffer(1, n, ctx.sampleRate);
   const data = buf.getChannelData(0);
-  // White noise...
   for (let i = 0; i < n; i++) data[i] = Math.random() * 2 - 1;
-  // ...then a 1-pole low-pass in the time domain to bias toward slow wobble.
-  // alpha for a cutoff around 6 Hz: alpha = dt / (rc + dt), rc = 1/(2π*fc)
+  // 1-pole low-pass (~6 Hz cutoff).
   const dt = 1 / ctx.sampleRate;
   const fc = 6;
   const rc = 1 / (2 * Math.PI * fc);
@@ -276,11 +274,30 @@ function makeNoiseModBuffer(ctx: OfflineAudioContext, durationSec: number): Audi
     prev = prev + alpha * (data[i] - prev);
     data[i] = prev;
   }
-  // Normalise to ±1
   let peak = 1e-6;
   for (let i = 0; i < n; i++) if (Math.abs(data[i]) > peak) peak = Math.abs(data[i]);
   for (let i = 0; i < n; i++) data[i] /= peak;
   return buf;
+}
+
+/**
+ * Generate a synthetic monaural impulse response for a small "outdoor"
+ * reverb. Decaying coloured noise — fast initial decay, longer tail.
+ * Used by the ConvolverNode to give the dry whistle a sense of being
+ * recorded in a real space.
+ */
+function createReverbIR(ctx: BaseAudioContext, durationSec = 1.2): AudioBuffer {
+  const sampleRate = ctx.sampleRate;
+  const length = Math.floor(sampleRate * durationSec);
+  const impulse = ctx.createBuffer(1, length, sampleRate);
+  const data = impulse.getChannelData(0);
+  for (let i = 0; i < length; i++) {
+    // Exponentially-decaying noise. The (1 - i/length)^4 envelope gives a
+    // dense early reflection followed by a long, soft tail.
+    const env = Math.pow(1 - i / length, 4);
+    data[i] = (Math.random() * 2 - 1) * env;
+  }
+  return impulse;
 }
 
 export async function translateToBird(
@@ -333,10 +350,12 @@ export async function translateToBird(
   const octaveShift = Math.round(Math.log2(bird.baseFreq / avgF0));
   const shiftFactor = Math.pow(2, octaveShift);
 
-  const tail = 0.25;
-  const totalLen = Math.floor((duration + tail) * sampleRate);
+  // Add tail for the reverb decay to fade out naturally.
+  const reverbTail = 1.4;
+  const totalLen = Math.floor((duration + reverbTail) * sampleRate);
   const offline = new OfflineAudioContext(1, totalLen, sampleRate);
 
+  // Safety limiter at the input of the master bus.
   const limiter = offline.createDynamicsCompressor();
   limiter.threshold.value = -1;
   limiter.knee.value = 3;
@@ -346,39 +365,68 @@ export async function translateToBird(
 
   const master = offline.createGain();
   master.gain.value = 0.45;
+  master.connect(offline.destination);
 
-  limiter.connect(master).connect(offline.destination);
+  // Dry path: limiter → master.
+  limiter.connect(master);
 
-  // Pure sine — matches the spectrum of real whistle (h2/h1 ≈ 0.005 measured).
+  // Wet path: limiter → convolver → reverbGain → master. The synthetic IR
+  // simulates an open garden / forest with ~1.2 s of decay.
+  const convolver = offline.createConvolver();
+  convolver.buffer = createReverbIR(offline, 1.2);
+  const reverbGain = offline.createGain();
+  reverbGain.gain.value = 0.3;
+  limiter.connect(convolver).connect(reverbGain).connect(master);
+
+  // ── Whistle voice ──
   const osc = offline.createOscillator();
   osc.type = "sine";
 
-  // Slow vibrato (~3 Hz, deep) — matches the measured profile of real whistles.
+  // Slow vibrato (~3 Hz), measured profile of real whistles.
   const lfo = offline.createOscillator();
   lfo.type = "sine";
   lfo.frequency.value = bird.trill;
   const lfoDepth = offline.createGain();
-  // Depth in Hz. With warble 0.6-1.0 this gives 48-100 Hz peak excursion,
-  // close to the measured 80-150 Hz of real whistles.
   lfoDepth.gain.value = bird.warble * 80;
   lfo.connect(lfoDepth);
   lfoDepth.connect(osc.frequency);
 
-  // Filtered noise on top of the LFO — provides the irregular micro-warble
-  // that distinguishes a human whistle from a steady oscillator. Without
-  // this the output sounds "too perfect" / digital.
-  const noiseBuf = makeNoiseModBuffer(offline, Math.min(2, duration + tail));
+  // Filtered-noise pitch jitter — natural breath/lip micro-wobble.
+  const noiseModBuf = makeNoiseModBuffer(offline, Math.min(2.0, duration + 0.5));
   const noiseSrc = offline.createBufferSource();
-  noiseSrc.buffer = noiseBuf;
+  noiseSrc.buffer = noiseModBuf;
   noiseSrc.loop = true;
   const noiseDepth = offline.createGain();
-  noiseDepth.gain.value = bird.warble * 35; // ~25-35 Hz of random wobble
+  noiseDepth.gain.value = bird.warble * 30;
   noiseSrc.connect(noiseDepth);
   noiseDepth.connect(osc.frequency);
 
+  // ── Breath texture ──
+  // White noise → bandpass (centred ~3.5 kHz, broad) → small gain → same
+  // envelope as the oscillator. This adds the airy texture of a real
+  // creature pushing breath through a beak/syringe. Gating through `env`
+  // means the breath is only present when the bird is "singing" — no
+  // background hiss between phrases.
+  const breathBuf = offline.createBuffer(1, totalLen, sampleRate);
+  const breathData = breathBuf.getChannelData(0);
+  for (let i = 0; i < totalLen; i++) breathData[i] = Math.random() * 2 - 1;
+  const breathSrc = offline.createBufferSource();
+  breathSrc.buffer = breathBuf;
+  const breathFilter = offline.createBiquadFilter();
+  breathFilter.type = "bandpass";
+  breathFilter.frequency.value = 3500;
+  breathFilter.Q.value = 0.5;
+  const breathGain = offline.createGain();
+  breathGain.gain.value = 0.06;
+
+  // ── Envelope (shared by oscillator and breath) ──
   const env = offline.createGain();
   env.gain.setValueAtTime(0, 0);
-  osc.connect(env).connect(limiter);
+
+  osc.connect(env);
+  breathSrc.connect(breathFilter).connect(breathGain).connect(env);
+
+  env.connect(limiter);
 
   osc.frequency.setValueAtTime(bird.baseFreq, 0);
 
@@ -388,7 +436,6 @@ export async function translateToBird(
     const t = i * hopSec;
     const f = f0Smooth[i];
     if (f > 0) {
-      // Real whistles top out around 2900 Hz — clamp tighter than before.
       const birdF = Math.min(2900, Math.max(800, f * shiftFactor));
       osc.frequency.linearRampToValueAtTime(birdF, t + hopSec);
       const targetGain = Math.min(0.55, (rmss[i] / peakRms) * 0.7);
@@ -402,10 +449,12 @@ export async function translateToBird(
   osc.start(0);
   lfo.start(0);
   noiseSrc.start(0);
-  const stopAt = duration + tail;
+  breathSrc.start(0);
+  const stopAt = duration + 0.2;
   osc.stop(stopAt);
   lfo.stop(stopAt);
   noiseSrc.stop(stopAt);
+  breathSrc.stop(stopAt);
 
   if (options.includeMic) {
     const micBuf = offline.createBuffer(1, samples.length, sampleRate);
