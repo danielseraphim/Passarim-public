@@ -7,20 +7,21 @@
 // quality. Each syllable is rendered as overlapping grains of the user's
 // own whistle sample.
 //
-// Four "musician" passes layered on top of literal transliteration:
-//   P1 — Articulation: hard duration cap (180 ms), enforced 40 ms silence
-//        between syllables, fast attacks. Each note has a clear start and
-//        a clear end — no legato bleed.
-//   P2 — Ornamentation: only on syllables that ARE phrase ends (gap to
-//        next onset > 1.5 × local mean inter-onset interval), and only
-//        with probability proportional to bird.warble. A short semitone
-//        trill (~40 ms) is appended.
-//   P3 — Microtonality: each syllable's anchor pitch is randomly detuned
-//        by ±6 cents — small enough to feel alive, not so much that it
-//        sounds out of tune.
-//   P4 — Phrasal accent (option B heuristic): first onset and onsets
-//        following a longer-than-average gap get +25 % amplitude and a
-//        sharper attack.
+// Pipeline overview:
+//   YIN (covers voice + whistle) → median filter → octave-error correction
+//   → EMA smoothing → onset detection (energy peaks AND pitch jumps)
+//   → for each onset: pick contour shape, anchor at user's pitch, schedule
+//     grains across the contour
+//   → reverb, formant filter, limiter
+//
+// Four "musician" passes layered on top:
+//   P1 — Articulation: hard duration cap (180 ms), enforced 40 ms silence,
+//        fast attacks. No legato bleed.
+//   P2 — Ornamentation: short semitone trills only on phrase ends, with
+//        probability proportional to bird.warble.
+//   P3 — Microtonality: ±6 cents random detune per syllable.
+//   P4 — Phrasal accent: first onset and onsets after longer-than-mean gap
+//        get +25 % amplitude and a sharper attack.
 
 const SOURCE_URL = "/whistle-source.ogg";
 const SOURCE_PITCH = 1500;
@@ -213,7 +214,6 @@ function yinPitch(
     run += diff[tau];
     cmnd[tau] = run > 0 ? (diff[tau] * tau) / run : 1;
   }
-  // Range covers both sung voice (~80-500 Hz) AND whistle (~700-3000 Hz).
   const minLag = Math.max(2, Math.floor(sampleRate / 3500));
   const maxLag = Math.min(halfN - 2, Math.floor(sampleRate / 80));
   if (maxLag <= minLag) return { f0: 0, conf: 0 };
@@ -253,6 +253,34 @@ function medianFilter(arr: number[], k = 7): number[] {
   return out;
 }
 
+/**
+ * Cross-frame octave-error correction. YIN sometimes locks onto a sub-
+ * harmonic (returning half the true F0) or a super-harmonic (double).
+ * For each voiced frame, compare against the median of voiced frames in
+ * a ±15-frame window. If it's <0.6× the median → octave-down error,
+ * multiply by 2. If >1.6× the median → octave-up error, divide by 2.
+ * Threshold 0.6/1.6 is conservative enough not to "fix" legitimate
+ * musical leaps (an octave is exactly 0.5/2.0).
+ */
+function correctOctaveErrors(f0: number[]): number[] {
+  const out = f0.slice();
+  const W = 15;
+  for (let i = 0; i < out.length; i++) {
+    if (out[i] === 0) continue;
+    const lo = Math.max(0, i - W);
+    const hi = Math.min(out.length - 1, i + W);
+    const win: number[] = [];
+    for (let j = lo; j <= hi; j++) if (j !== i && out[j] > 0) win.push(out[j]);
+    if (win.length < 4) continue;
+    win.sort((a, b) => a - b);
+    const median = win[win.length >> 1];
+    const ratio = out[i] / median;
+    if (ratio < 0.6) out[i] = out[i] * 2;
+    else if (ratio > 1.6) out[i] = out[i] / 2;
+  }
+  return out;
+}
+
 function emaSmooth(arr: number[], alpha = 0.4): number[] {
   const out = arr.slice();
   let prev = 0;
@@ -272,8 +300,20 @@ function emaSmooth(arr: number[], alpha = 0.4): number[] {
   return out;
 }
 
-function detectOnsets(rmss: number[], hopSec: number): number[] {
+/**
+ * Onset detection — combines energy peaks (good for articulated input
+ * like "lá-lá-lá") with pitch-change detection (good for legato whistled
+ * input where amplitude doesn't dip much between notes). Both feed into
+ * a single sorted-and-deduped list with a refractory period.
+ */
+function detectOnsets(
+  rmss: number[],
+  f0: number[],
+  hopSec: number,
+): number[] {
   if (rmss.length < 4) return [];
+
+  // ── Energy onsets (existing logic) ──
   const sm = new Array(rmss.length);
   let s = 0;
   for (let i = 0; i < rmss.length; i++) {
@@ -284,23 +324,58 @@ function detectOnsets(rmss: number[], hopSec: number): number[] {
   for (const v of sm) if (v > peak) peak = v;
   const threshold = peak * 0.18;
   const refractoryFrames = Math.max(4, Math.floor(0.09 / hopSec));
-  const onsets: number[] = [];
-  let lastOnset = -refractoryFrames;
+  const energyOnsets: number[] = [];
+  let lastEnergyOnset = -refractoryFrames;
   for (let i = 1; i < sm.length - 1; i++) {
-    if (i - lastOnset < refractoryFrames) continue;
+    if (i - lastEnergyOnset < refractoryFrames) continue;
     if (sm[i] > threshold && sm[i] > sm[i - 1] * 1.3 && sm[i] >= sm[i + 1]) {
-      onsets.push(i);
-      lastOnset = i;
+      energyOnsets.push(i);
+      lastEnergyOnset = i;
     }
   }
-  if (onsets.length === 0) {
+
+  // ── Pitch-change onsets ──
+  // Track a slowly-updated "current note" pitch. When a frame's pitch
+  // departs from it by >50 cents, that's a new note onset.
+  const pitchOnsets: number[] = [];
+  let stablePitch = 0;
+  for (let i = 0; i < f0.length; i++) {
+    if (f0[i] === 0) continue;
+    if (stablePitch === 0) {
+      stablePitch = f0[i];
+      continue;
+    }
+    const cents = Math.abs(1200 * Math.log2(f0[i] / stablePitch));
+    if (cents > 50) {
+      pitchOnsets.push(i);
+      stablePitch = f0[i]; // reset to new note
+    } else {
+      // slowly drift the stable estimate
+      stablePitch = stablePitch * 0.7 + f0[i] * 0.3;
+    }
+  }
+
+  // ── Merge & dedupe with refractory ──
+  const all = [...energyOnsets, ...pitchOnsets].sort((a, b) => a - b);
+  const merged: number[] = [];
+  let last = -refractoryFrames;
+  for (const idx of all) {
+    if (idx - last >= refractoryFrames) {
+      merged.push(idx);
+      last = idx;
+    }
+  }
+
+  // Stationary fallback: if NEITHER kind of onset fired, sprinkle a regular
+  // pulse so we still produce something rather than silence.
+  if (merged.length === 0) {
     const totalDur = rmss.length * hopSec;
     const count = Math.max(3, Math.min(14, Math.round(totalDur / 0.35)));
     for (let i = 0; i < count; i++) {
-      onsets.push(Math.floor(((i + 0.5) / count) * rmss.length));
+      merged.push(Math.floor(((i + 0.5) / count) * rmss.length));
     }
   }
-  return onsets;
+  return merged;
 }
 
 type ContourShape = "rise" | "fall" | "arch" | "dip" | "trill";
@@ -366,15 +441,13 @@ function buildContour(
   return pts;
 }
 
-/** Append a brief semitone trill at the end of a contour (P2 ornament). */
 function appendOrnament(
   contour: { t: number; f: number }[],
   baseDuration: number,
   anchorPitch: number,
 ): { contour: { t: number; f: number }[]; newDuration: number } {
-  const ornDur = 0.045; // 45 ms tail
+  const ornDur = 0.045;
   const semitoneRatio = Math.pow(2, 1 / 12);
-  // 4 quick alternations between anchor and anchor+semitone
   const newPts = contour.slice();
   const N = 5;
   for (let k = 1; k <= N; k++) {
@@ -456,16 +529,20 @@ export async function translateToBird(
     if (conf > 0.4 && f0 > 80 && f0 < 3500) f0s[i] = f0;
   }
 
+  // Pipeline: median → octave correction → EMA. Pitch-jump onsets use the
+  // median+corrected version (sharp transitions preserved); syllable anchor
+  // sampling uses the EMA-smoothed version (no micro-jitter).
   const f0Med = medianFilter(f0s, 7);
-  const f0Smooth = emaSmooth(f0Med, 0.4);
+  const f0Corr = correctOctaveErrors(f0Med);
+  const f0Smooth = emaSmooth(f0Corr, 0.4);
   const hopSec = hop / decRate;
 
-  const onsets = detectOnsets(rmss, hopSec);
+  const onsets = detectOnsets(rmss, f0Corr, hopSec);
   if (onsets.length === 0) return new Float32Array(0);
 
   let voicedSum = 0,
     voicedCount = 0;
-  for (const f of f0Smooth)
+  for (const f of f0Corr)
     if (f > 0) {
       voicedSum += f;
       voicedCount++;
@@ -474,7 +551,7 @@ export async function translateToBird(
   const octaveShift = Math.round(Math.log2(bird.baseFreq / avgF0));
   const shiftFactor = Math.pow(2, octaveShift);
 
-  // ── P4: compute mean inter-onset interval (IOI) for accent detection ──
+  // P4: mean inter-onset interval for accent detection
   const iois: number[] = [];
   for (let i = 1; i < onsets.length; i++) {
     iois.push((onsets[i] - onsets[i - 1]) * hopSec);
@@ -485,15 +562,13 @@ export async function translateToBird(
   const rng = makeRng(onsets.length * 1009 + Math.floor(bird.baseFreq));
   const syllables: Syllable[] = [];
 
-  // P1 — articulation parameters
-  const MAX_DUR = 0.18; // hard cap on syllable length
+  const MAX_DUR = 0.18;
   const MIN_DUR = 0.06;
-  const MIN_SILENCE = 0.04; // forced silence between syllables
+  const MIN_SILENCE = 0.04;
 
   for (let i = 0; i < onsets.length; i++) {
     const idx = onsets[i];
 
-    // Sample user pitch around the onset (±100 ms).
     let userPitch = 0;
     for (let d = 0; d < 10 && userPitch === 0; d++) {
       if (idx + d < f0Smooth.length && f0Smooth[idx + d] > 0)
@@ -507,21 +582,14 @@ export async function translateToBird(
     const nextStart =
       i + 1 < onsets.length ? onsets[i + 1] * hopSec : duration;
     const gap = nextStart - start;
-
-    // ── P1: articulation — short syllable with forced trailing silence
     let dur = Math.min(MAX_DUR, Math.max(MIN_DUR, gap - MIN_SILENCE));
 
-    // ── P4: accent — first onset, or onset that follows a longer-than-mean gap
     const prevGap = i === 0 ? Infinity : start - onsets[i - 1] * hopSec;
     const isAccented = i === 0 || prevGap > meanIOI * 1.3;
-
-    // ── P2: ornamentation — only on phrase-end syllables
     const isPhraseEnd = i === onsets.length - 1 || gap > meanIOI * 1.5;
     const ornamentProb = 0.5 + bird.warble * 0.3;
-    const wantOrnament =
-      isPhraseEnd && dur > 0.10 && rng() < ornamentProb;
+    const wantOrnament = isPhraseEnd && dur > 0.10 && rng() < ornamentProb;
 
-    // ── P3: microtonality — ±6 cents per syllable (random, fixed for the syllable)
     const detuneCents = (rng() - 0.5) * 12;
     const detuneRatio = Math.pow(2, detuneCents / 1200);
 
@@ -544,7 +612,6 @@ export async function translateToBird(
     syllables.push({ start, duration: dur, amplitude, contour, isAccented });
   }
 
-  // ── Render setup ──
   const reverbTail = 1.4;
   const totalLen = Math.floor((duration + reverbTail) * sampleRate);
   const offline = new OfflineAudioContext(1, totalLen, sampleRate);
@@ -600,8 +667,7 @@ export async function translateToBird(
     const sylEnv = offline.createGain();
     sylEnv.connect(highpass);
 
-    // P1 — sharper attacks. Accented syllables get an even faster attack.
-    const baseAttack = 0.006 + (1 - bird.attackHardness) * 0.008; // 6-14 ms
+    const baseAttack = 0.006 + (1 - bird.attackHardness) * 0.008;
     const attack = syl.isAccented ? baseAttack * 0.6 : baseAttack;
     const release = 0.04;
 
@@ -640,7 +706,6 @@ export async function translateToBird(
       sourcePos = (sourcePos + 0.014) % sourceUsableLen;
     }
 
-    // Onset transient. Accented syllables get a louder transient.
     const noiseSrc = offline.createBufferSource();
     noiseSrc.buffer = noiseBuf;
     const noiseBp = offline.createBiquadFilter();
